@@ -1,0 +1,30 @@
+# secrets: never in the tree
+.env
+.env.*
+!.env.example
+*.jarvis.env
+.webui_secret_key
+
+# runtime
+.logs/
+*.log
+*.pid
+.jarvis_rag_cache.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+
+# backups
+*.bak*/

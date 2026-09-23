@@ -1,0 +1,87 @@
+# Jarvis runtime topology and routing policy.
+# Secrets never go here; they live in ~/.jarvis.env and are read by config.py.
+
+paths:
+  log_dir: .logs              # relative to the repo root
+  trace_dir: .logs/traces
+
+rag:
+  cache_file: ~/.jarvis_rag_cache.json
+  projects:
+    - name: portfolio-showcase-platform
+      path: ~/projects/portfolio-showcase-platform
+
+devices:
+  mini:
+    role: control-plane
+    host: 10.0.0.40
+    port: 11434
+    ram_gb: 16
+    max_loaded_models: 2          # resident classifier + one worker model
+    heavy_concurrency: 1          # one 7B/8B call at a time
+    min_free_gb_for_heavy: 6      # refuse a heavy call below this headroom
+    always_on: true
+
+  macbook-pro:
+    role: worker
+    host: 10.0.0.47
+    fallback_host: Gauttams-MacBook-Pro.local
+    port: 11434
+    ram_gb: 32
+    gpu_wired_limit_mb: 26624
+    max_loaded_models: 1          # 18 GB model, nothing else fits beside it
+    heavy_concurrency: 1
+    min_free_gb_for_heavy: 4
+    always_on: false              # sleeps on lid close, may be away
+    measured:
+      qwen3:30b-a3b-instruct-2507-q4_K_M: {size_gb: 18, load_s: 9.5, generate_tps: 39.2}
+      qwen2.5-coder:14b:                  {size_gb: 9.0, load_s: 10.1, generate_tps: 12.1}
+
+registry:
+  poll_interval_s: 20
+  offline_after_failures: 2
+  online_after_successes: 1
+
+# Tiers are what the policy engine reasons about. Each tier lists candidate
+# deployments in preference order; the first one whose device is online,
+# has the model pulled, and has memory headroom wins. LiteLLM deployment
+# names match configs/litellm.yaml.
+tiers:
+  classify:
+    - {device: mini, model: llama3.2:3b, litellm: classifier, resident: true}
+  embed:
+    - {device: mini, model: nomic-embed-text, litellm: embed-mini, resident: true}
+  general-small:
+    - {device: mini, model: llama3.1:8b, litellm: general}
+  code-small:
+    - {device: mini, model: qwen2.5-coder:7b, litellm: coding}
+  reasoning-large:
+    - {device: macbook-pro, model: qwen3:30b-a3b-instruct-2507-q4_K_M, litellm: large-mbp}
+    - {device: mini, model: deepseek-r1:8b, litellm: reasoning, degraded: true}
+  code-large:
+    - {device: macbook-pro, model: qwen3:30b-a3b-instruct-2507-q4_K_M, litellm: large-mbp}
+    - {device: mini, model: qwen2.5-coder:7b, litellm: coding, degraded: true}
+  judge:
+    - {device: mini, model: llama3.1:8b, litellm: general}
+
+# Not in the routing mix on purpose: qwen2.5-coder:14b on macbook-pro.
+# It exists for benchmarks and emergency fallback only; loading it beside
+# the 30B forces a ~10 s swap. See docs/adr/0005-single-large-model-per-node.md
+
+budgets:
+  request_wall_s: 600
+  subtask_wall_s: {large: 420, small: 300}
+  tokens:
+    system: 600
+    history: 2000
+    rag: 1500
+    handoff: 2500
+    answer: {large: 6000, small: 4000}
+  num_ctx: {large: 16384, small: 8192, classify: 4096}
+
+guards:
+  min_answer_chars: 40
+  max_repeat_ratio: 0.35
+  max_think_answer_ratio: 4.0
+  judge_threshold: 3
+  judge_max_retries: 1
