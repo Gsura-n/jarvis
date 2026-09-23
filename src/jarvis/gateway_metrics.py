@@ -6,6 +6,7 @@ Import and use in gateway.py when trace is requested.
 
 import os
 import time
+
 import psutil
 
 
@@ -23,10 +24,10 @@ def get_system_memory() -> dict:
     try:
         vm = psutil.virtual_memory()
         return {
-            "total_gb":     round(vm.total     / 1024**3, 1),
+            "total_gb": round(vm.total / 1024**3, 1),
             "available_gb": round(vm.available / 1024**3, 1),
-            "used_gb":      round(vm.used      / 1024**3, 1),
-            "percent":      vm.percent,
+            "used_gb": round(vm.used / 1024**3, 1),
+            "percent": vm.percent,
         }
     except Exception:
         return {}
@@ -52,23 +53,25 @@ class StepTimer:
 
     def start(self, name: str):
         self._current = {
-            "name":       name,
-            "t_start":    time.time(),
+            "name": name,
+            "t_start": time.time(),
             "mem_before": get_memory_mb(),
         }
 
     def end(self, name: str):
         if self._current.get("name") != name:
             return
-        t_end   = time.time()
+        t_end = time.time()
         mem_end = get_memory_mb()
-        self.steps.append({
-            "name":       name,
-            "duration_s": round(t_end - self._current["t_start"], 2),
-            "mem_before": self._current["mem_before"],
-            "mem_after":  mem_end,
-            "mem_delta":  round(mem_end - self._current["mem_before"], 1),
-        })
+        self.steps.append(
+            {
+                "name": name,
+                "duration_s": round(t_end - self._current["t_start"], 2),
+                "mem_before": self._current["mem_before"],
+                "mem_after": mem_end,
+                "mem_delta": round(mem_end - self._current["mem_before"], 1),
+            }
+        )
         self._current = {}
 
     def total_time(self) -> float:

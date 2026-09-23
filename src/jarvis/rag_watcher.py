@@ -5,24 +5,24 @@ Only re-ingests changed/new files — not the full project.
 Supports multiple projects simultaneously.
 """
 
-import os
-import sys
-import time
-import json
 import hashlib
-import requests
+import json
+import time
 from pathlib import Path
-from jarvis.config import settings
+
+import requests
 from neo4j import GraphDatabase
-from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
+from jarvis.config import settings
 
 # ── Config ────────────────────────────────────────────────────────────────────
-NEO4J_URI      = settings.neo4j_uri
-NEO4J_USER     = settings.neo4j_user
+NEO4J_URI = settings.neo4j_uri
+NEO4J_USER = settings.neo4j_user
 NEO4J_PASSWORD = settings.neo4j_password
-OLLAMA_BASE    = settings.ollama_base
-EMBED_MODEL    = settings.embed_model
+OLLAMA_BASE = settings.ollama_base
+EMBED_MODEL = settings.embed_model
 
 # File types to watch
 EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".py", ".cls", ".trigger", ".apex"}
@@ -43,7 +43,7 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # ── Hash cache ────────────────────────────────────────────────────────────────
 def load_hash_cache() -> dict:
     try:
-        with open(HASH_CACHE_FILE, "r") as f:
+        with open(HASH_CACHE_FILE) as f:
             return json.load(f)
     except Exception:
         return {}
@@ -88,7 +88,8 @@ def upsert_file(file_path: Path, project_name: str, project_root: Path):
             return
 
         with driver.session() as session:
-            session.run("""
+            session.run(
+                """
                 MERGE (f:File {path: $path, repo: $repo})
                 SET f.name = $name,
                     f.extension = $ext,
@@ -115,10 +116,14 @@ def delete_file(relative_path: str, project_name: str):
     """Remove a deleted file from Neo4j."""
     try:
         with driver.session() as session:
-            session.run("""
+            session.run(
+                """
                 MATCH (f:File {path: $path, repo: $repo})
                 DETACH DELETE f
-            """, path=relative_path, repo=project_name)
+            """,
+                path=relative_path,
+                repo=project_name,
+            )
         print(f"  🗑️  Deleted: {relative_path}")
     except Exception as e:
         print(f"  ❌ Error deleting {relative_path}: {e}")

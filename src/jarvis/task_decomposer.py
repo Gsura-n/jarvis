@@ -10,35 +10,38 @@ Features:
   - Shared context bus across agents
 """
 
-import os
 import json
 import re
-import requests
-from typing import TypedDict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from langgraph.graph import StateGraph, END
+from typing import TypedDict
+
+import requests
+from langgraph.graph import END, StateGraph
+
 from jarvis.config import settings
 from jarvis.subtask_tracer import traced_stream_call
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LITELLM_BASE = settings.litellm_base
-LITELLM_KEY  = settings.litellm_key
+LITELLM_KEY = settings.litellm_key
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
 class JarvisState(TypedDict):
-    prompt:        str
-    complexity:    str
-    reasoning:     str
-    subtasks:      List[dict]
-    results:       List[dict]
-    rag_context:   str
-    final_answer:  str
-    error:         Optional[str]
+    prompt: str
+    complexity: str
+    reasoning: str
+    subtasks: list[dict]
+    results: list[dict]
+    rag_context: str
+    final_answer: str
+    error: str | None
 
 
 # ── LiteLLM helper ────────────────────────────────────────────────────────────
-def call_model(model: str, system: str, user: str, temperature: float = 0.3, max_tokens: int = 3000, _retry: bool = True) -> str:
+def call_model(
+    model: str, system: str, user: str, temperature: float = 0.3, max_tokens: int = 3000, _retry: bool = True
+) -> str:
     try:
         r = requests.post(
             f"{LITELLM_BASE}/chat/completions",
@@ -47,7 +50,7 @@ def call_model(model: str, system: str, user: str, temperature: float = 0.3, max
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
+                    {"role": "user", "content": user},
                 ],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -64,6 +67,7 @@ def call_model(model: str, system: str, user: str, temperature: float = 0.3, max
         if _retry:
             print(f"   [call_model] {model} failed ({e}) — retrying once...")
             import time as _t
+
             _t.sleep(2)
             return call_model(model, system, user, temperature, max_tokens, _retry=False)
         return f"[ERROR] {e}"
@@ -75,7 +79,7 @@ def parse_json(text: str) -> dict:
         clean = clean.replace(fence, "")
     clean = clean.strip()
     start = clean.find("{")
-    end   = clean.rfind("}") + 1
+    end = clean.rfind("}") + 1
     if start >= 0 and end > start:
         clean = clean[start:end]
     return json.loads(clean)
@@ -109,13 +113,14 @@ Respond ONLY with valid JSON:
 }
 """
 
+
 def detect_complexity(state: JarvisState) -> JarvisState:
     print(f"\n🔍 Detecting complexity for: {state['prompt'][:80]}...")
     try:
         result = call_model("general", COMPLEXITY_SYSTEM, state["prompt"], temperature=0.1)
         parsed = parse_json(result)
         complexity = parsed.get("complexity", "simple")
-        reasoning  = parsed.get("reasoning", "")
+        reasoning = parsed.get("reasoning", "")
         print(f"   → Complexity: {complexity} | {reasoning}")
         return {**state, "complexity": complexity, "reasoning": reasoning}
     except Exception as e:
@@ -172,8 +177,9 @@ Respond ONLY with valid JSON:
 implements MUST be a single number or null, NEVER a list.
 """
 
+
 def split_tasks(state: JarvisState) -> JarvisState:
-    print(f"\n📋 Splitting into subtasks...")
+    print("\n📋 Splitting into subtasks...")
     try:
         result = call_model(
             "general",
@@ -181,7 +187,7 @@ def split_tasks(state: JarvisState) -> JarvisState:
             f"Original prompt: {state['prompt']}\n\nContext: {state['reasoning']}",
             temperature=0.2,
         )
-        parsed   = parse_json(result)
+        parsed = parse_json(result)
         subtasks = parsed.get("subtasks", [])
 
         # Normalize: ensure implements is single value, intent is clean
@@ -199,7 +205,7 @@ def split_tasks(state: JarvisState) -> JarvisState:
         for t in subtasks:
             deps = t.get("depends_on", [])
             par = " [PARALLEL]" if not deps else f" [waits for {deps}]"
-            impl = f" implements#{t.get('implements')}" if t.get('implements') else ""
+            impl = f" implements#{t.get('implements')}" if t.get("implements") else ""
             print(f"     [{t['id']}] ({t['intent']}) {t['task'][:50]}...{par}{impl}")
 
         return {**state, "subtasks": subtasks}
@@ -207,21 +213,23 @@ def split_tasks(state: JarvisState) -> JarvisState:
         print(f"   → Splitting failed: {e}")
         return {
             **state,
-            "subtasks": [{"id": 1, "task": state["prompt"], "intent": "general", "depends_on": [], "implements": None}]
+            "subtasks": [
+                {"id": 1, "task": state["prompt"], "intent": "general", "depends_on": [], "implements": None}
+            ],
         }
 
 
 # ── Node 3 — Parallel Task Executor with Structured Handoff ───────────────────
 INTENT_TO_MODEL = {
-    "code":      "coding",
+    "code": "coding",
     "reasoning": "reasoning",
-    "general":   "general",
+    "general": "general",
 }
 
 INTENT_SYSTEM = {
-    "code":      "You are an expert coder. Write clean, production-ready code with comments.",
+    "code": "You are an expert coder. Write clean, production-ready code with comments.",
     "reasoning": "You are an expert architect. Be DECISIVE. Briefly consider the key options, then COMMIT to a clear recommendation. Do NOT enumerate every possibility or keep second-guessing — pick the best approach and justify it concisely. State your final recommendation explicitly and clearly. Aim to conclude within a few paragraphs.",
-    "general":   "You are a helpful expert assistant. Be clear and concise.",
+    "general": "You are a helpful expert assistant. Be clear and concise.",
 }
 
 HANDOFF_SYSTEM = """You are an expert coder receiving a handoff from a reasoning model.
@@ -248,8 +256,8 @@ def is_broken_result(text: str) -> bool:
 
 def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict:
     """Execute one subtask. Used by both parallel and sequential paths."""
-    intent     = subtask.get("intent", "general")
-    model      = INTENT_TO_MODEL.get(intent, "general")
+    intent = subtask.get("intent", "general")
+    model = INTENT_TO_MODEL.get(intent, "general")
     implements = subtask.get("implements")
     if isinstance(implements, list):
         implements = implements[0] if implements else None
@@ -263,15 +271,15 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
             if is_broken_result(dep_result):
                 print(f"      ⚠️  skipping broken context from subtask [{dep_id}]")
                 continue
-            dep_context += f"\n### Result from subtask [{dep_id}]: {completed[dep_id]['task']}\n{dep_result[:1000]}\n"
+            dep_context += (
+                f"\n### Result from subtask [{dep_id}]: {completed[dep_id]['task']}\n{dep_result[:1000]}\n"
+            )
 
     # Structured handoff — only if the reasoning subtask produced a GOOD result.
     # If the handoff source is broken, fall back to standalone execution using
     # the original task + RAG, rather than building on garbage.
     handoff_ok = (
-        implements
-        and implements in completed
-        and not is_broken_result(completed[implements]["result"])
+        implements and implements in completed and not is_broken_result(completed[implements]["result"])
     )
 
     if handoff_ok:
@@ -296,12 +304,14 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
     # a larger budget AND more wall-clock time. Code/general are faster.
     if model == "reasoning":
         token_budget = 6000
-        wall_limit   = 420   # 7 min — DeepSeek is thorough but slow
+        wall_limit = 420  # 7 min — DeepSeek is thorough but slow
     else:
         token_budget = 4000
-        wall_limit   = 300   # 5 min
+        wall_limit = 300  # 5 min
     result_text = traced_stream_call(
-        model, system, user_prompt,
+        model,
+        system,
+        user_prompt,
         subtask_id=subtask["id"],
         task_desc=subtask["task"][:80],
         max_tokens=token_budget,
@@ -310,11 +320,11 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
     print(f"     ✅ [{subtask['id']}] done ({len(result_text)} chars)")
 
     return {
-        "id":         subtask["id"],
-        "task":       subtask["task"],
-        "intent":     intent,
+        "id": subtask["id"],
+        "task": subtask["task"],
+        "intent": intent,
         "implements": implements,
-        "result":     result_text,
+        "result": result_text,
     }
 
 
@@ -327,20 +337,17 @@ def execute_tasks(state: JarvisState) -> JarvisState:
     """
     print(f"\n⚙️  Executing {len(state['subtasks'])} subtask(s) sequentially...")
 
-    subtasks    = state["subtasks"]
-    completed   = {}
-    results     = []
+    subtasks = state["subtasks"]
+    completed = {}
+    results = []
     rag_context = state.get("rag_context", "")
-    remaining   = list(subtasks)
-    max_rounds  = len(subtasks) + 2
-    rnd         = 0
+    remaining = list(subtasks)
+    max_rounds = len(subtasks) + 2
+    rnd = 0
 
     while remaining and rnd < max_rounds:
         rnd += 1
-        ready = [
-            t for t in remaining
-            if all(d in completed for d in t.get("depends_on", []))
-        ]
+        ready = [t for t in remaining if all(d in completed for d in t.get("depends_on", []))]
         if not ready:
             break
 
@@ -359,13 +366,13 @@ def execute_tasks_parallel(state: JarvisState) -> JarvisState:
     """PARALLEL version — kept for Phase 6 multi-device. Do not use on single machine."""
     print(f"\n⚙️  Executing {len(state['subtasks'])} subtask(s) with parallelism...")
 
-    subtasks    = state["subtasks"]
-    completed   = {}
-    results     = []
+    subtasks = state["subtasks"]
+    completed = {}
+    results = []
     rag_context = state.get("rag_context", "")
-    remaining   = list(subtasks)
-    max_rounds  = len(subtasks) + 2
-    rnd         = 0
+    remaining = list(subtasks)
+    max_rounds = len(subtasks) + 2
+    rnd = 0
 
     while remaining and rnd < max_rounds:
         rnd += 1
@@ -442,7 +449,10 @@ def aggregate_results(state: JarvisState) -> JarvisState:
         print(f"   ⚠️  dropped {dropped} broken subtask result(s) from aggregation")
 
     if not results:
-        return {**state, "final_answer": "[All subtasks failed to produce usable output. Check the traces directory.]"}
+        return {
+            **state,
+            "final_answer": "[All subtasks failed to produce usable output. Check the traces directory.]",
+        }
 
     if len(results) == 1:
         return {**state, "final_answer": results[0]["result"]}
@@ -492,19 +502,21 @@ def route_by_complexity(state: JarvisState) -> str:
 # ── Build Graph ───────────────────────────────────────────────────────────────
 def build_graph():
     graph = StateGraph(JarvisState)
-    graph.add_node("detect",    detect_complexity)
-    graph.add_node("split",     split_tasks)
-    graph.add_node("execute",   execute_tasks)
+    graph.add_node("detect", detect_complexity)
+    graph.add_node("split", split_tasks)
+    graph.add_node("execute", execute_tasks)
     graph.add_node("aggregate", aggregate_results)
     graph.set_entry_point("detect")
     graph.add_conditional_edges("detect", route_by_complexity, {"split": "split", "execute": "execute"})
-    graph.add_edge("split",     "execute")
-    graph.add_edge("execute",   "aggregate")
+    graph.add_edge("split", "execute")
+    graph.add_edge("execute", "aggregate")
     graph.add_edge("aggregate", END)
     return graph.compile()
 
 
 _graph = None
+
+
 def get_graph():
     global _graph
     if _graph is None:
@@ -516,25 +528,24 @@ def get_graph():
 def decompose_and_execute(prompt: str, rag_context: str = "") -> dict:
     graph = get_graph()
     initial_state: JarvisState = {
-        "prompt":       prompt,
-        "complexity":   "",
-        "reasoning":    "",
-        "subtasks":     [],
-        "results":      [],
-        "rag_context":  rag_context,
+        "prompt": prompt,
+        "complexity": "",
+        "reasoning": "",
+        "subtasks": [],
+        "results": [],
+        "rag_context": rag_context,
         "final_answer": "",
-        "error":        None,
+        "error": None,
     }
     final_state = graph.invoke(initial_state)
-    models_used = list(set(
-        INTENT_TO_MODEL.get(r["intent"], "general")
-        for r in final_state.get("results", [])
-    ))
+    models_used = list(
+        set(INTENT_TO_MODEL.get(r["intent"], "general") for r in final_state.get("results", []))
+    )
     return {
-        "answer":      final_state.get("final_answer", ""),
-        "complexity":  final_state.get("complexity", "simple"),
-        "subtasks":    final_state.get("subtasks", []),
-        "results":     final_state.get("results", []),
+        "answer": final_state.get("final_answer", ""),
+        "complexity": final_state.get("complexity", "simple"),
+        "subtasks": final_state.get("subtasks", []),
+        "results": final_state.get("results", []),
         "models_used": models_used,
     }
 

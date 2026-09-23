@@ -15,16 +15,18 @@ Usage in decomposer:
     result = traced_stream_call(model, system, user, subtask_id, task_desc)
 """
 
+import json
 import os
 import re
 import time
-import json
-import requests
 from datetime import datetime
+
+import requests
+
 from jarvis.config import settings
 
 LITELLM_BASE = settings.litellm_base
-LITELLM_KEY  = settings.litellm_key
+LITELLM_KEY = settings.litellm_key
 
 # Trace directory — created on demand (default: <repo>/.logs/traces, set in jarvis.yaml)
 TRACE_DIR = str(settings.trace_dir)
@@ -72,6 +74,7 @@ def traced_stream_call(
     # Used as a fallback if the model spirals and never produces an answer.
     # Bounded so memory stays flat even on a 14000-char think spiral.
     from collections import deque
+
     think_tail = deque(maxlen=4000)  # chars, not tokens
 
     # We keep ONLY the answer in memory (needed for return value).
@@ -85,7 +88,7 @@ def traced_stream_call(
             tf.write(f"Model: {model}\n")
             tf.write(f"Started: {datetime.now().strftime('%H:%M:%S')}\n")
             tf.write(f"Task: {task_desc}\n")
-            tf.write(f"{'='*50}\n\n")
+            tf.write(f"{'=' * 50}\n\n")
             tf.flush()
 
             r = requests.post(
@@ -95,7 +98,7 @@ def traced_stream_call(
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system},
-                        {"role": "user",   "content": user},
+                        {"role": "user", "content": user},
                     ],
                     "temperature": temperature,
                     "max_tokens": max_tokens,
@@ -154,7 +157,7 @@ def traced_stream_call(
             # Stats footer
             duration = round(time.time() - start, 1)
             ratio = round(think_chars / max(answer_chars, 1), 2)
-            tf.write(f"\n\n--- STATS ---\n")
+            tf.write("\n\n--- STATS ---\n")
             tf.write(f"Duration: {duration}s\n")
             tf.write(f"Thinking chars: {think_chars}\n")
             tf.write(f"Answer chars: {answer_chars}\n")
@@ -187,7 +190,7 @@ def traced_stream_call(
         # Log the failure too
         try:
             with open(trace_path, "a", encoding="utf-8") as tf:
-                tf.write(f"\n\n--- ERROR ---\n{e}\nDuration before fail: {round(time.time()-start,1)}s\n")
+                tf.write(f"\n\n--- ERROR ---\n{e}\nDuration before fail: {round(time.time() - start, 1)}s\n")
         except Exception:
             pass
         return f"[ERROR] {e}"
@@ -203,7 +206,7 @@ def _plain_call(model, system, user, temperature, timeout):
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
+                    {"role": "user", "content": user},
                 ],
                 "temperature": temperature,
             },
@@ -239,7 +242,9 @@ def summarize_traces(n: int = 5) -> str:
             spiral = "⚠️ SPIRAL" if "HIGH RATIO" in content else ""
             name = os.path.basename(path)
             lines.append(f"  {name}")
-            lines.append(f"    duration={dur.group(1) if dur else '?'}s  ratio={ratio.group(1) if ratio else '?'}  {spiral}")
+            lines.append(
+                f"    duration={dur.group(1) if dur else '?'}s  ratio={ratio.group(1) if ratio else '?'}  {spiral}"
+            )
         except Exception:
             pass
     return "\n".join(lines)

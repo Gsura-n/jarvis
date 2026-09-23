@@ -3,6 +3,7 @@ Tests for logic that needs no model, no network and no secrets.
 The first eval layer in the design is deterministic checks; these tests are the seed of it.
 """
 
+import json
 import os
 import time
 
@@ -62,7 +63,7 @@ def test_parse_json_tolerates_fences_and_prose(raw):
 
 
 def test_parse_json_rejects_garbage():
-    with pytest.raises(Exception):
+    with pytest.raises(json.JSONDecodeError):
         decomposer.parse_json("no json here")
 
 

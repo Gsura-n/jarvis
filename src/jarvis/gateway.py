@@ -9,28 +9,29 @@ OpenAI-compatible API that orchestrates:
   6. Model trace on demand with timing + memory
 """
 
-import os
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
+
 from jarvis.config import settings
 from jarvis.gateway_metrics import StepTimer
 from jarvis.task_decomposer import decompose_and_execute
-import uvicorn
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Config — everything comes from jarvis.config (env file + jarvis.yaml) ─────
-LITELLM_BASE   = settings.litellm_base
-LITELLM_KEY    = settings.litellm_key
-NEO4J_URI      = settings.neo4j_uri
-NEO4J_USER     = settings.neo4j_user
+LITELLM_BASE = settings.litellm_base
+LITELLM_KEY = settings.litellm_key
+NEO4J_URI = settings.neo4j_uri
+NEO4J_USER = settings.neo4j_user
 NEO4J_PASSWORD = settings.neo4j_password
-OLLAMA_BASE    = settings.ollama_base
-EMBED_MODEL    = settings.embed_model
+OLLAMA_BASE = settings.ollama_base
+EMBED_MODEL = settings.embed_model
 
 # Validate required credentials at startup
 _missing = settings.missing_required()
@@ -39,30 +40,44 @@ if _missing:
     print(f"   Add them to {settings.env_file}")
 
 MODELS = {
-    "general":   "general",
-    "code":      "coding",
+    "general": "general",
+    "code": "coding",
     "reasoning": "reasoning",
 }
 
 TRACE_TRIGGERS = [
-    "which model", "what model", "why did you", "how did you",
-    "explain your process", "show trace", "model trace", "who answered",
+    "which model",
+    "what model",
+    "why did you",
+    "how did you",
+    "explain your process",
+    "show trace",
+    "model trace",
+    "who answered",
 ]
 
 RAG_TRIGGERS = [
-    "my project", "my code", "my repo", "my codebase", "my file",
-    "this project", "this repo", "this code", "this file",
-    "in the project", "in the codebase", "in my app",
-    "portfolio", "agent page", "dashboard", "component",
+    "my project",
+    "my code",
+    "my repo",
+    "my codebase",
+    "my file",
+    "this project",
+    "this repo",
+    "this code",
+    "this file",
+    "in the project",
+    "in the codebase",
+    "in my app",
+    "portfolio",
+    "agent page",
+    "dashboard",
+    "component",
 ]
 
 app = FastAPI(title="Jarvis Smart Gateway")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
@@ -100,7 +115,8 @@ def rag_query(question: str, top_k: int = 4) -> str:
                 ORDER BY score DESC LIMIT $k
                 RETURN f.path AS path, f.content_preview AS preview, score
                 """,
-                emb=embedding, k=top_k,
+                emb=embedding,
+                k=top_k,
             )
             rows = [dict(r) for r in result]
         if not rows:
@@ -197,7 +213,7 @@ def enhance_and_classify(user_message: str) -> dict:
             "classifier",
             [
                 {"role": "system", "content": ENHANCE_SYSTEM},
-                {"role": "user",   "content": user_message},
+                {"role": "user", "content": user_message},
             ],
             temperature=0.1,
         )
@@ -225,7 +241,7 @@ def enhance_and_classify(user_message: str) -> dict:
             "enhanced_prompt": user_message,
             "intent": intent,
             "needs_rag": keyword_rag,
-            "rag_reason": "fallback classifier"
+            "rag_reason": "fallback classifier",
         }
 
     if keyword_rag:
@@ -244,37 +260,55 @@ def execute(intent: str, enhanced_prompt: str, rag_context: str, tracker: StepTi
 
     if intent == "general":
         tracker.start("llm_general")
-        answer = chat("general", [
-            {"role": "system", "content": system_base},
-            {"role": "user",   "content": enhanced_prompt},
-        ])
+        answer = chat(
+            "general",
+            [
+                {"role": "system", "content": system_base},
+                {"role": "user", "content": enhanced_prompt},
+            ],
+        )
         tracker.end("llm_general")
         return answer, ["general (llama3.1:8b)"]
 
     if intent == "code":
         tracker.start("llm_code")
-        answer = chat("coding", [
-            {"role": "system", "content": system_base + "\nWrite clean, production-ready code with comments."},
-            {"role": "user",   "content": enhanced_prompt},
-        ])
+        answer = chat(
+            "coding",
+            [
+                {
+                    "role": "system",
+                    "content": system_base + "\nWrite clean, production-ready code with comments.",
+                },
+                {"role": "user", "content": enhanced_prompt},
+            ],
+        )
         tracker.end("llm_code")
         return answer, ["coding (qwen2.5-coder:7b)"]
 
     if intent == "reasoning":
         tracker.start("llm_reasoning")
-        answer = chat("reasoning", [
-            {"role": "system", "content": system_base + "\nThink step by step. Be thorough."},
-            {"role": "user",   "content": enhanced_prompt},
-        ])
+        answer = chat(
+            "reasoning",
+            [
+                {"role": "system", "content": system_base + "\nThink step by step. Be thorough."},
+                {"role": "user", "content": enhanced_prompt},
+            ],
+        )
         tracker.end("llm_reasoning")
         return answer, ["reasoning (deepseek-r1:8b)"]
 
     if intent == "code+reasoning":
         tracker.start("llm_reasoning")
-        reasoning_answer = chat("reasoning", [
-            {"role": "system", "content": system_base + "\nThink step by step. Produce a clear solution design."},
-            {"role": "user",   "content": enhanced_prompt},
-        ])
+        reasoning_answer = chat(
+            "reasoning",
+            [
+                {
+                    "role": "system",
+                    "content": system_base + "\nThink step by step. Produce a clear solution design.",
+                },
+                {"role": "user", "content": enhanced_prompt},
+            ],
+        )
         tracker.end("llm_reasoning")
 
         tracker.start("llm_code")
@@ -282,10 +316,16 @@ def execute(intent: str, enhanced_prompt: str, rag_context: str, tracker: StepTi
             f"Based on this solution design:\n\n{reasoning_answer}\n\n"
             f"Now implement the code for:\n{enhanced_prompt}"
         )
-        code_answer = chat("coding", [
-            {"role": "system", "content": system_base + "\nWrite clean, production-ready code with comments."},
-            {"role": "user",   "content": coding_prompt},
-        ])
+        code_answer = chat(
+            "coding",
+            [
+                {
+                    "role": "system",
+                    "content": system_base + "\nWrite clean, production-ready code with comments.",
+                },
+                {"role": "user", "content": coding_prompt},
+            ],
+        )
         tracker.end("llm_code")
 
         combined = f"{reasoning_answer}\n\n---\n\n### Implementation\n\n{code_answer}"
@@ -293,10 +333,13 @@ def execute(intent: str, enhanced_prompt: str, rag_context: str, tracker: StepTi
 
     # fallback
     tracker.start("llm_fallback")
-    answer = chat("general", [
-        {"role": "system", "content": system_base},
-        {"role": "user",   "content": enhanced_prompt},
-    ])
+    answer = chat(
+        "general",
+        [
+            {"role": "system", "content": system_base},
+            {"role": "user", "content": enhanced_prompt},
+        ],
+    )
     tracker.end("llm_fallback")
     return answer, ["general (llama3.1:8b)"]
 
@@ -348,8 +391,8 @@ async def completions(request: Request):
         tracker.end("enhance_classify")
 
         enhanced_prompt = meta.get("enhanced_prompt", user_msg)
-        intent          = meta.get("intent", "general")
-        needs_rag       = meta.get("needs_rag", False)
+        intent = meta.get("intent", "general")
+        needs_rag = meta.get("needs_rag", False)
 
         # If RAG wasn't started but intent needs it, start now
         rag_context = ""
@@ -372,11 +415,12 @@ async def completions(request: Request):
 
     # Step 3 — check if task needs decomposition
     if intent == "code+reasoning" and not wants_trace:
-        print(f"[Decomposer] Routing to task decomposer...")
+        print("[Decomposer] Routing to task decomposer...")
         tracker.start("task_decomposition")
         # Run decomposer in a worker thread so the async event loop isn't blocked.
         # Use asyncio.to_thread (clean, no manual executor management).
         import asyncio
+
         decomp = await asyncio.to_thread(decompose_and_execute, enhanced_prompt, rag_context)
         tracker.end("task_decomposition")
 
@@ -385,18 +429,22 @@ async def completions(request: Request):
         subtask_info = f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
         answer += subtask_info
 
-        return JSONResponse({
-            "id":      f"jarvis-{int(tracker.wall_start)}",
-            "object":  "chat.completion",
-            "created": int(tracker.wall_start),
-            "model":   "jarvis",
-            "choices": [{
-                "index":         0,
-                "message":       {"role": "assistant", "content": answer},
-                "finish_reason": "stop",
-            }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+        return JSONResponse(
+            {
+                "id": f"jarvis-{int(tracker.wall_start)}",
+                "object": "chat.completion",
+                "created": int(tracker.wall_start),
+                "model": "jarvis",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": answer},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
 
     # Step 3 — streaming path (simple intents only, no trace, no chaining)
     if wants_stream and not wants_trace and intent != "code+reasoning":
@@ -414,19 +462,15 @@ async def completions(request: Request):
                 model_alias,
                 [
                     {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": enhanced_prompt},
-                ]
+                    {"role": "user", "content": enhanced_prompt},
+                ],
             ):
                 chunk = {
                     "id": msg_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": "jarvis",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": token},
-                        "finish_reason": None
-                    }]
+                    "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
             yield "data: [DONE]\n\n"
@@ -443,23 +487,26 @@ async def completions(request: Request):
             f"- Intent: `{intent}`\n"
             f"- RAG used: `{'yes' if rag_context else 'no'}`\n"
             f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n"
-            f"- Enhanced prompt: _{enhanced_prompt}_\n\n"
-            + tracker.summary()
+            f"- Enhanced prompt: _{enhanced_prompt}_\n\n" + tracker.summary()
         )
         answer += trace
 
-    return JSONResponse({
-        "id":      f"jarvis-{int(tracker.wall_start)}",
-        "object":  "chat.completion",
-        "created": int(tracker.wall_start),
-        "model":   "jarvis",
-        "choices": [{
-            "index":         0,
-            "message":       {"role": "assistant", "content": answer},
-            "finish_reason": "stop",
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    })
+    return JSONResponse(
+        {
+            "id": f"jarvis-{int(tracker.wall_start)}",
+            "object": "chat.completion",
+            "created": int(tracker.wall_start),
+            "model": "jarvis",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": answer},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+    )
 
 
 # ── Other endpoints ───────────────────────────────────────────────────────────
@@ -467,24 +514,28 @@ async def completions(request: Request):
 def health():
     return {"status": "ok", "gateway": "jarvis", "port": 4001}
 
+
 @app.get("/v1/models")
 def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": "coding",    "object": "model", "owned_by": "jarvis"},
+            {"id": "coding", "object": "model", "owned_by": "jarvis"},
             {"id": "reasoning", "object": "model", "owned_by": "jarvis"},
-            {"id": "general",   "object": "model", "owned_by": "jarvis"},
-        ]
+            {"id": "general", "object": "model", "owned_by": "jarvis"},
+        ],
     }
+
 
 @app.get("/v1/openapi.json")
 def openapi_spec():
     return {"openapi": "3.0.0", "info": {"title": "Jarvis Gateway", "version": "1.0.0"}, "paths": {}}
 
+
 @app.get("/v1/api/config")
 def api_config():
     return {"status": "ok", "name": "Jarvis Gateway", "version": "1.0.0"}
+
 
 if __name__ == "__main__":
     print("🧠 Jarvis Smart Gateway starting on port 4001...")
