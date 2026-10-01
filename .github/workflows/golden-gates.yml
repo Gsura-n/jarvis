@@ -23,7 +23,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -38,11 +38,11 @@ jobs:
     # SEC-001 to SEC-005, SEC-007: fail only on findings new in this PR
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Semgrep
@@ -50,44 +50,48 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           pip install --quiet semgrep==1.178.0
-          if [ -n "$BASE_SHA" ]; then
-            semgrep scan --config p/default --metrics=off --error --baseline-commit "$BASE_SHA"
-          else
-            semgrep scan --config p/default --metrics=off --error
-          fi
+          args="--config p/default --metrics=off --json --output /tmp/semgrep.json"
+          if [ -n "$BASE_SHA" ]; then args="$args --baseline-commit $BASE_SHA"; fi
+          semgrep scan $args || true
+          python3 scripts/golden/report.py semgrep /tmp/semgrep.json
 
   dependencies:
-    # SUP-001, SUP-002, SEC-007: known vulnerabilities in locked dependencies
+    # SUP-001, SUP-002, SEC-007: known vulnerabilities in the project's dependencies
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Audit dependencies
         run: |
           set -e
+          status=0
           ran=0
+          python -m venv /tmp/tools && /tmp/tools/bin/pip install --quiet uv pip-audit==2.10.1
+          audit() {
+            /tmp/tools/bin/pip-audit -r "$1" --disable-pip --no-deps --format json --output /tmp/audit.json || true
+            python3 scripts/golden/report.py pip-audit /tmp/audit.json || status=1
+          }
           if [ -f uv.lock ]; then
-            pip install --quiet uv pip-audit==2.10.1
-            uv export --frozen --no-hashes --all-groups --no-emit-project -o /tmp/requirements.txt
-            pip-audit -r /tmp/requirements.txt
+            /tmp/tools/bin/uv export --frozen --no-hashes --all-groups --no-emit-project -o /tmp/requirements.txt
+            audit /tmp/requirements.txt
             ran=1
           elif ls requirements*.txt >/dev/null 2>&1; then
-            pip install --quiet pip-audit==2.10.1
-            for f in requirements*.txt; do pip-audit -r "$f"; done
+            for f in requirements*.txt; do audit "$f"; done
             ran=1
           elif [ -f pyproject.toml ]; then
             echo "::warning::No Python lockfile found. Pin dependencies in a committed lockfile (SUP-002)."
-            python -m venv /tmp/audit && . /tmp/audit/bin/activate
-            pip install --quiet . pip-audit==2.10.1
-            pip-audit --skip-editable
+            python -m venv /tmp/proj && /tmp/proj/bin/pip install --quiet .
+            /tmp/proj/bin/pip freeze --exclude-editable | grep -viE '^(pip|setuptools|wheel)==| @ file:' > /tmp/requirements.txt
+            audit /tmp/requirements.txt
             ran=1
           fi
           if [ -f package-lock.json ]; then
-            npm audit --audit-level=high --omit=dev
+            npm audit --audit-level=high --omit=dev || status=1
             ran=1
           fi
           [ "$ran" = 1 ] || echo "No supported manifest found; skipping."
+          exit $status
