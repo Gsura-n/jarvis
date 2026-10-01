@@ -1,0 +1,97 @@
+# Golden Rules gates for every pull request. Rule IDs refer to RULES.md in golden-rules.
+# Actions are pinned to commit SHAs (SUP-005); Dependabot proposes bumps.
+name: golden-gates
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: golden-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guardrails:
+    # PR size (REV-002), test weakening (TST-002), agent and CI config changes (AGT-003),
+    # hidden Unicode in instruction files (AGT-004)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Golden Rules PR checks
+        env:
+          GOLDEN_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_REF: ${{ github.base_ref }}
+        run: python3 scripts/golden/check_pr.py all --base "origin/${BASE_REF}"
+
+
+  sast:
+    # SEC-001 to SEC-005, SEC-007: fail only on findings new in this PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Semgrep
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          pip install --quiet semgrep==1.178.0
+          args="--config p/default --metrics=off --json --output /tmp/semgrep.json"
+          if [ -n "$BASE_SHA" ]; then args="$args --baseline-commit $BASE_SHA"; fi
+          semgrep scan $args || true
+          python3 scripts/golden/report.py semgrep /tmp/semgrep.json
+
+  dependencies:
+    # SUP-001, SUP-002, SEC-007: known vulnerabilities in the project's dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Audit dependencies
+        run: |
+          set -e
+          status=0
+          ran=0
+          python -m venv /tmp/tools && /tmp/tools/bin/pip install --quiet uv pip-audit==2.10.1
+          audit() {
+            /tmp/tools/bin/pip-audit -r "$1" --disable-pip --no-deps --format json --output /tmp/audit.json || true
+            python3 scripts/golden/report.py pip-audit /tmp/audit.json || status=1
+          }
+          if [ -f uv.lock ]; then
+            /tmp/tools/bin/uv export --frozen --no-hashes --all-groups --no-emit-project -o /tmp/requirements.txt
+            audit /tmp/requirements.txt
+            ran=1
+          elif ls requirements*.txt >/dev/null 2>&1; then
+            for f in requirements*.txt; do audit "$f"; done
+            ran=1
+          elif [ -f pyproject.toml ]; then
+            echo "::warning::No Python lockfile found. Pin dependencies in a committed lockfile (SUP-002)."
+            python -m venv /tmp/proj && /tmp/proj/bin/pip install --quiet .
+            /tmp/proj/bin/pip freeze --exclude-editable | grep -viE '^(pip|setuptools|wheel)==| @ file:' > /tmp/requirements.txt
+            audit /tmp/requirements.txt
+            ran=1
+          fi
+          if [ -f package-lock.json ]; then
+            npm audit --audit-level=high --omit=dev || status=1
+            ran=1
+          fi
+          [ "$ran" = 1 ] || echo "No supported manifest found; skipping."
+          exit $status

@@ -22,3 +22,11 @@ repos:
       - id: check-added-large-files
         args: [--maxkb=500]
       - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: golden-hidden-unicode  # AGT-004
+        name: hidden Unicode in agent instruction files
+        entry: python3 scripts/golden/check_pr.py unicode
+        language: system
+        files: (AGENTS|CLAUDE|GEMINI|SKILL)\.md$|\.cursorrules$|\.mdc$|copilot-instructions\.md$|^\.claude/
