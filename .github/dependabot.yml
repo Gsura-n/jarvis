@@ -1,0 +1,17 @@
+# Keeps pinned actions and dependencies current, with a cooldown so brand new
+# releases (the usual window for malicious versions) are not proposed (SUP-004, SUP-005).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5

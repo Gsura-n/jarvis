@@ -1,0 +1,8 @@
+# Owner review for security-sensitive and agent configuration paths (REV-004, AGT-003).
+# Replace with your GitHub handle or team.
+/AGENTS.md                  @Gsura-n
+/CLAUDE.md                  @Gsura-n
+/.claude/                   @Gsura-n
+/.github/                   @Gsura-n
+/.pre-commit-config.yaml    @Gsura-n
+/scripts/golden/            @Gsura-n
