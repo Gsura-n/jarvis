@@ -60,7 +60,9 @@ PROTECTED = (
 INSTRUCTION_FILE = re.compile(
     r"(^|/)(AGENTS|CLAUDE|GEMINI|SKILL)\.md$|(^|/)\.cursorrules$|(^|/)\.cursor/|(^|/)\.claude/|copilot-instructions\.md$|\.mdc$"
 )
-HIDDEN = re.compile("[​-‏‪-‮⁠-⁤⁦-⁩﻿\U000e0000-\U000e007f]")
+HIDDEN = re.compile(
+    "[\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff\\U000e0000-\\U000e007f]"
+)
 
 
 def git(*args: str) -> str:
