@@ -96,3 +96,10 @@ def test_devices_requires_the_api_key(monkeypatch):
     body = response.json()
     assert body["devices"]["mini"]["online"] is True
     assert "macbook-pro" in body["devices"]
+
+
+def test_model_names_normalize_untagged_models():
+    from jarvis.registry import _model_names
+
+    names = _model_names({"models": [{"name": "nomic-embed-text"}, {"name": "llama3.1:8b"}]})
+    assert names == ("nomic-embed-text:latest", "llama3.1:8b")
