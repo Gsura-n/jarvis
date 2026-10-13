@@ -24,7 +24,14 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
 
-from jarvis.budget import REFERENCE_RULE, answer_token_budget, assemble_messages, context_window, token_caps
+from jarvis.budget import (
+    REFERENCE_RULE,
+    answer_token_budget,
+    assemble_messages,
+    context_window,
+    history_trim_block,
+    token_caps,
+)
 from jarvis.config import cors_origins, jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
 from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
@@ -409,6 +416,7 @@ def budgeted_messages(
         max_tokens=max_tokens,
         num_ctx=context_window(settings.topology, alias),
         caps=token_caps(settings.topology),
+        block=history_trim_block(settings.topology),
     )
     return messages, max_tokens
 
