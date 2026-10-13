@@ -7,11 +7,13 @@ import yaml
 
 from jarvis.budget import (
     _cost,
+    _history_cost,
     answer_token_budget,
     assemble_messages,
     context_window,
     estimate_tokens,
     fit_input,
+    token_caps,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,7 +160,7 @@ def test_caps_cut_rag_and_halve_history_in_pairs():
     )
     assert estimate_tokens(fitted.rag) <= 30
     history_cost = sum(estimate_tokens(item["content"]) + 4 for item in fitted.history)
-    assert history_cost <= caps["history"] // 2
+    assert history_cost <= caps["history"]
     assert fitted.history[0]["role"] == "user"
     assert [item["role"] for item in fitted.history] == ["user", "assistant"] * (len(fitted.history) // 2)
 
@@ -227,3 +229,98 @@ def test_decomposer_handoff_and_rag_reach_the_user_message(monkeypatch):
     assert "src/app.py defines main" in captured["user"]
     assert "Recommend a small module." not in captured["system"]
     assert "reference material from the codebase" in captured["system"]
+
+
+def _turn_text(label: str, tokens: int) -> str:
+    raw = f"{label}:" + ("x" * (tokens * 4))
+    return raw[: tokens * 4]
+
+
+def _exchange(label: str, tokens: int = 100) -> list[dict]:
+    half = tokens // 2
+    return [
+        {"role": "user", "content": _turn_text(f"u{label}", half)},
+        {"role": "assistant", "content": _turn_text(f"a{label}", tokens - half)},
+    ]
+
+
+def test_long_chat_keeps_a_stable_history_prefix():
+    """Fails on the half-cut: once trimming starts, the prefix misses on every turn."""
+    config = _yaml("jarvis.yaml")
+    deployment = "general-small-mini"
+    block = int(config["budgets"].get("history_trim_block", 4))
+    caps = token_caps(config)
+    num_ctx = context_window(config, deployment)
+    max_tokens = answer_token_budget(deployment, config)
+    conversation: list[dict] = []
+    previous: list[dict] | None = None
+    misses: list[int] = []
+    for turn in range(1, 21):
+        question = _turn_text(f"q{turn:02d}", 150)
+        answer = _turn_text(f"a{turn:02d}", 300)
+        fitted = fit_input(
+            system="You are a helper.",
+            history=conversation,
+            rag="",
+            handoff="",
+            user=question,
+            max_tokens=max_tokens,
+            num_ctx=num_ctx,
+            caps=caps,
+            block=block,
+        )
+        kept = list(fitted.history)
+        assert _history_cost(kept) <= caps["history"]
+        if kept:
+            assert kept[0]["role"] == "user"
+        if previous is not None:
+            prefix = previous + [
+                {"role": "user", "content": _turn_text(f"q{turn - 1:02d}", 150)},
+                {"role": "assistant", "content": _turn_text(f"a{turn - 1:02d}", 300)},
+            ]
+            if kept[: len(prefix)] != prefix:
+                misses.append(turn)
+        previous = kept
+        conversation = conversation + [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+    assert misses, "a 20-turn chat at this size has to trim history"
+    start = misses[0]
+    for begin in range(start, 21, block):
+        window = [turn for turn in misses if begin <= turn < begin + block]
+        assert len(window) <= 1, misses
+
+
+def test_block_of_one_is_a_sliding_window():
+    caps = {"history": 250}
+    history = []
+    for index in range(5):
+        history.extend(_exchange(str(index), tokens=100))
+    fitted = fit_input(
+        system="s",
+        history=history,
+        rag="",
+        handoff="",
+        user="q",
+        max_tokens=10,
+        num_ctx=10000,
+        caps=caps,
+        block=1,
+    )
+    wide = fit_input(
+        system="s",
+        history=history,
+        rag="",
+        handoff="",
+        user="q",
+        max_tokens=10,
+        num_ctx=10000,
+        caps=caps,
+        block=4,
+    )
+    # Each exchange costs 108. The cap holds two, so a window of 1 keeps the newest two.
+    assert [item["content"][:2] for item in fitted.history] == ["u3", "a3", "u4", "a4"]
+    assert fitted.history[0]["role"] == "user"
+    assert _history_cost(list(fitted.history)) <= 250
+    assert len(wide.history) < len(fitted.history)
