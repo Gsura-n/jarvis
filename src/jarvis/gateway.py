@@ -26,7 +26,8 @@ from neo4j import GraphDatabase
 from jarvis.budget import answer_token_budget, assemble_messages, context_window
 from jarvis.config import jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
-from jarvis.registry import Registry, current_snapshot, set_registry
+from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
+from jarvis.registry import Registry, bind_snapshot, current_snapshot, mini_only, reset_snapshot, set_registry
 from jarvis.task_decomposer import decompose_and_execute
 
 # ── Config — everything comes from jarvis.config (env file + jarvis.yaml) ─────
@@ -44,12 +45,8 @@ if _missing:
     print(f"⚠️  Missing required env vars: {', '.join(_missing)}")
     print(f"   Add them to {settings.env_file}")
 
-# Concrete deployment names from jarvis.yaml. policy.decide() replaces this map next.
-MODELS = {
-    "general": "general-small-mini",
-    "code": "code-small-mini",
-    "reasoning": "reasoning-large-mini",
-}
+_EXPLICIT_INTENT = {"general": "general", "coding": "code", "reasoning": "reasoning"}
+_semaphores: dict[str, asyncio.Semaphore] = {}
 
 TRACE_TRIGGERS = [
     "which model",
@@ -107,6 +104,24 @@ try:
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 except Exception:
     driver = None
+
+
+def explicit_model(name: str | None) -> str | None:
+    return name if name in _EXPLICIT_INTENT else None
+
+
+def device_semaphore(device: str) -> asyncio.Semaphore:
+    """One heavy call at a time per machine. Classifier and embedder do not take this."""
+    sem = _semaphores.get(device)
+    if sem is None:
+        raw = settings.topology.get("devices", {}).get(device, {}).get("heavy_concurrency", 1)
+        sem = asyncio.Semaphore(max(1, int(raw)))
+        _semaphores[device] = sem
+    return sem
+
+
+def classify_deployment(snapshot) -> str:
+    return walk_tier("classify", snapshot, settings.topology, "classify").deployment or "classify-mini"
 
 
 def get_embedding(text: str) -> list:
@@ -238,13 +253,13 @@ Respond ONLY with valid JSON, no markdown:
 """
 
 
-def enhance_and_classify(user_message: str) -> dict:
+def enhance_and_classify(user_message: str, deployment: str = "classify-mini") -> dict:
     msg_lower = user_message.lower()
     keyword_rag = any(t in msg_lower for t in RAG_TRIGGERS)
 
     try:
         result = chat(
-            "classify-mini",
+            deployment,
             [
                 {"role": "system", "content": ENHANCE_SYSTEM},
                 {"role": "user", "content": user_message},
@@ -323,80 +338,52 @@ def execute(
     enhanced_prompt: str,
     rag_context: str,
     tracker: StepTimer,
-    history: list | None = None,
+    history: list | None,
+    decision: Decision,
 ) -> tuple[str, list[str]]:
     system_base = "You are a helpful expert assistant."
     history = history or []
+    alias = decision.deployment
+    label = f"{alias} ({decision.device})"
 
     if intent == "general":
         tracker.start("llm_general")
-        messages, max_tokens = budgeted_messages(
-            "general", system_base, enhanced_prompt, rag_context, history
-        )
-        answer = chat("general", messages, max_tokens=max_tokens)
+        messages, max_tokens = budgeted_messages(alias, system_base, enhanced_prompt, rag_context, history)
+        answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_general")
-        return answer, ["general (llama3.1:8b)"]
+        return answer, [label]
 
     if intent == "code":
         tracker.start("llm_code")
         messages, max_tokens = budgeted_messages(
-            "coding",
+            alias,
             system_base + "\nWrite clean, production-ready code with comments.",
             enhanced_prompt,
             rag_context,
             history,
         )
-        answer = chat("coding", messages, max_tokens=max_tokens)
+        answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_code")
-        return answer, ["coding (qwen2.5-coder:7b)"]
+        return answer, [label]
 
-    if intent == "reasoning":
+    if intent == "reasoning" or intent == "code+reasoning":
+        # code+reasoning is one call when the large tier is really available (ADR 0007).
+        extra = "\nThink step by step. Be thorough."
+        if intent == "code+reasoning":
+            extra += "\nDesign the solution, then implement it in the same answer."
         tracker.start("llm_reasoning")
         messages, max_tokens = budgeted_messages(
-            "reasoning",
-            system_base + "\nThink step by step. Be thorough.",
-            enhanced_prompt,
-            rag_context,
-            history,
+            alias, system_base + extra, enhanced_prompt, rag_context, history
         )
-        answer = chat("reasoning", messages, max_tokens=max_tokens)
+        answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_reasoning")
-        return answer, ["reasoning (deepseek-r1:8b)"]
+        return answer, [label]
 
-    if intent == "code+reasoning":
-        tracker.start("llm_reasoning")
-        messages, max_tokens = budgeted_messages(
-            "reasoning",
-            system_base + "\nThink step by step. Produce a clear solution design.",
-            enhanced_prompt,
-            rag_context,
-            history,
-        )
-        reasoning_answer = chat("reasoning", messages, max_tokens=max_tokens)
-        tracker.end("llm_reasoning")
-
-        tracker.start("llm_code")
-        coding_prompt = f"Based on this solution design:\n\n{reasoning_answer}\n\nNow implement the code for:\n{enhanced_prompt}"
-        messages, max_tokens = budgeted_messages(
-            "coding",
-            system_base + "\nWrite clean, production-ready code with comments.",
-            coding_prompt,
-            rag_context,
-            history,
-            handoff=reasoning_answer,
-        )
-        code_answer = chat("coding", messages, max_tokens=max_tokens)
-        tracker.end("llm_code")
-
-        combined = f"{reasoning_answer}\n\n---\n\n### Implementation\n\n{code_answer}"
-        return combined, ["reasoning (deepseek-r1:8b)", "coding (qwen2.5-coder:7b)"]
-
-    # fallback
     tracker.start("llm_fallback")
-    messages, max_tokens = budgeted_messages("general", system_base, enhanced_prompt, rag_context, history)
-    answer = chat("general", messages, max_tokens=max_tokens)
+    messages, max_tokens = budgeted_messages(alias, system_base, enhanced_prompt, rag_context, history)
+    answer = chat(alias, messages, max_tokens=max_tokens)
     tracker.end("llm_fallback")
-    return answer, ["general (llama3.1:8b)"]
+    return answer, [label]
 
 
 # ── Main endpoint ─────────────────────────────────────────────────────────────
@@ -415,9 +402,12 @@ async def completions(request: Request):
     if not user_msg:
         return JSONResponse({"error": "No user message found"}, status_code=400)
 
-    wants_trace = any(t in user_msg.lower() for t in TRACE_TRIGGERS)
+    requested = body.get("model")
+    explicit = explicit_model(requested if isinstance(requested, str) else None)
+    wants_trace = requested == "jarvis-trace" or any(t in user_msg.lower() for t in TRACE_TRIGGERS)
     history = prior_turns(messages, user_msg)
     tracker = StepTimer()
+    snapshot = current_snapshot()
 
     # Step 1 — parallel enhance+classify AND early RAG keyword check
     msg_lower = user_msg.lower()
@@ -430,19 +420,32 @@ async def completions(request: Request):
     classify_future = None
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        # Always start classify
-        classify_future = executor.submit(enhance_and_classify, user_msg)
+        if explicit:
+            meta = {
+                "enhanced_prompt": user_msg,
+                "intent": _EXPLICIT_INTENT[explicit],
+                "needs_rag": keyword_rag,
+                "rag_reason": "explicit model",
+            }
+            classify_future = None
+        else:
+            classify_future = executor.submit(enhance_and_classify, user_msg, classify_deployment(snapshot))
 
         # Start RAG early if keyword match detected
         if keyword_rag:
             rag_future = executor.submit(rag_query, user_msg)
 
-        # Get classify result
-        try:
-            meta = classify_future.result()
-        except Exception as e:
-            print(f"[Classify] error: {e}")
-            meta = {"enhanced_prompt": user_msg, "intent": "general", "needs_rag": False, "rag_reason": ""}
+        if classify_future is not None:
+            try:
+                meta = classify_future.result()
+            except Exception as e:
+                print(f"[Classify] error: {e}")
+                meta = {
+                    "enhanced_prompt": user_msg,
+                    "intent": "general",
+                    "needs_rag": False,
+                    "rag_reason": "",
+                }
 
         tracker.end("enhance_classify")
 
@@ -465,21 +468,32 @@ async def completions(request: Request):
 
         tracker.end("rag")
 
-    # Step 3 — check if task needs decomposition
-    if intent == "code+reasoning" and not wants_trace:
-        print("[Decomposer] Routing to task decomposer...")
+    decision = decide(intent, str(meta.get("complexity") or ""), explicit, snapshot, settings.topology)
+    # Degraded design-and-build, or an explicit jarvis-decompose, stays on the mini.
+    if prefer_decomposer(intent, explicit, decision, requested == "jarvis-decompose"):
+        print("[Decomposer] Routing to task decomposer on the mini...")
         tracker.start("task_decomposition")
-        # Run decomposer in a worker thread so the async event loop isn't blocked.
-        # Use asyncio.to_thread (clean, no manual executor management).
-        import asyncio
-
-        decomp = await asyncio.to_thread(decompose_and_execute, enhanced_prompt, rag_context)
+        token = bind_snapshot(mini_only(snapshot))
+        try:
+            async with device_semaphore("mini"):
+                decomp = await asyncio.to_thread(decompose_and_execute, enhanced_prompt, rag_context)
+        finally:
+            reset_snapshot(token)
         tracker.end("task_decomposition")
+        decision = Decision(
+            decision.tier, "decomposer", "mini", True, decision.reason + "; decomposer on mini"
+        )
 
         answer = decomp["answer"]
         models_used = decomp["models_used"]
-        subtask_info = f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
-        answer += subtask_info
+        answer += f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
+        if wants_trace:
+            answer += (
+                f"\n\n---\n**Model trace:**\n- Intent: `{intent}`\n- Tier: `{decision.tier}`\n"
+                f"- Device: `{decision.device}`\n- Deployment: `{decision.deployment}`\n"
+                f"- Degraded: `{str(decision.degraded).lower()}`\n- Reason: {decision.reason}\n"
+                f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n\n" + tracker.summary()
+            )
 
         return JSONResponse(
             {
@@ -498,42 +512,61 @@ async def completions(request: Request):
             }
         )
 
-    # Step 3 — streaming path (simple intents only, no trace, no chaining)
-    if wants_stream and not wants_trace and intent != "code+reasoning":
-        model_alias = MODELS.get(intent, "general")
+    # Step 3 — streaming path. Heavy calls hold that device's semaphore until the stream ends.
+    if wants_stream and not wants_trace and decision.deployment != "decomposer":
         system_msg = "You are a helpful expert assistant."
         if intent == "code":
             system_msg += "\nWrite clean, production-ready code with comments."
-        elif intent == "reasoning":
+        elif intent in ("reasoning", "code+reasoning"):
             system_msg += "\nThink step by step. Be thorough."
         stream_messages, max_tokens = budgeted_messages(
-            model_alias, system_msg, enhanced_prompt, rag_context, history
+            decision.deployment, system_msg, enhanced_prompt, rag_context, history
         )
-
         msg_id = f"jarvis-{int(time.time())}"
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
 
-        def stream_generator():
-            for token in chat_stream(model_alias, stream_messages, max_tokens=max_tokens):
-                chunk = {
-                    "id": msg_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": "jarvis",
-                    "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
+        def produce():
+            try:
+                for token in chat_stream(decision.deployment, stream_messages, max_tokens=max_tokens):
+                    asyncio.run_coroutine_threadsafe(queue.put(token), loop).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+
+        async def stream_generator():
+            async with device_semaphore(decision.device):
+                worker = asyncio.create_task(asyncio.to_thread(produce))
+                try:
+                    while (token := await queue.get()) is not None:
+                        chunk = {
+                            "id": msg_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": "jarvis",
+                            "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                finally:
+                    await worker
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-    # Step 3 — non-streaming execute
-    answer, models_used = execute(intent, enhanced_prompt, rag_context, tracker, history)
+    if decision.deployment != "decomposer":
+        async with device_semaphore(decision.device):
+            answer, models_used = await asyncio.to_thread(
+                execute, intent, enhanced_prompt, rag_context, tracker, history, decision
+            )
 
-    # Step 4 — trace
     if wants_trace:
         trace = (
             f"\n\n---\n**Model trace:**\n"
             f"- Intent: `{intent}`\n"
+            f"- Tier: `{decision.tier}`\n"
+            f"- Device: `{decision.device}`\n"
+            f"- Deployment: `{decision.deployment}`\n"
+            f"- Degraded: `{str(decision.degraded).lower()}`\n"
+            f"- Reason: {decision.reason}\n"
             f"- RAG used: `{'yes' if rag_context else 'no'}`\n"
             f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n"
             f"- Enhanced prompt: _{enhanced_prompt}_\n\n" + tracker.summary()
