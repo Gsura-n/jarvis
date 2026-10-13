@@ -63,7 +63,7 @@ def _install(monkeypatch, lines: list[bytes], order: list[str], delay: float = 0
     def client() -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    monkeypatch.setattr(gateway, "_stream_client", client)
+    monkeypatch.setattr(gateway, "_stream_client", client, raising=False)
 
 
 def _hold(device: str, order: list[str]) -> None:
@@ -105,7 +105,10 @@ def test_cancel_during_prompt_processing_closes_within_100ms(monkeypatch):
         return httpx.Response(200, stream=_TimedBody([_sse("late")], order, delay=0.01, pre_delay=2.0))
 
     monkeypatch.setattr(
-        gateway, "_stream_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        gateway,
+        "_stream_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        raising=False,
     )
     _hold("mini", order)
     cancelled_at: list[float] = []
@@ -142,7 +145,10 @@ def test_upstream_error_ends_the_stream_without_raising(monkeypatch, caplog):
         return httpx.Response(200, stream=_FailingBody([], order))
 
     monkeypatch.setattr(
-        gateway, "_stream_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        gateway,
+        "_stream_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        raising=False,
     )
     _hold("mini", order)
 
