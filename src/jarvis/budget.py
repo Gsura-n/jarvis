@@ -61,28 +61,34 @@ def _mark(trimmed: list[str], name: str) -> None:
         trimmed.append(name)
 
 
-def _drop_pair(history: list[dict]) -> None:
-    """Drop the oldest user turn and its assistant reply. A leading assistant turn goes too."""
-    while history and history[0].get("role") != "user":
-        history.pop(0)
-    if not history:
-        return
-    history.pop(0)
-    if history and history[0].get("role") == "assistant":
-        history.pop(0)
+def _exchanges(history: list[dict]) -> list[list[dict]]:
+    """One user message plus the assistant messages after it. Leading assistants are dropped."""
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    for item in history:
+        if item.get("role") == "user":
+            if current:
+                groups.append(current)
+            current = [dict(item)]
+        elif current and item.get("role") == "assistant":
+            current.append(dict(item))
+    if current:
+        groups.append(current)
+    return groups
 
 
-def _cut_history(history: list[dict], target: int) -> None:
-    while history and history[0].get("role") != "user":
-        history.pop(0)
-    while history and _history_cost(history) > target:
-        before = len(history)
-        _drop_pair(history)
-        if len(history) == before:
-            history.clear()
-            return
-    while history and history[0].get("role") != "user":
-        history.pop(0)
+def _trim_exchanges(history: list[dict], max_cost: int, block: int) -> list[dict]:
+    """Drop oldest exchanges in blocks of `block`, anchored to the start of the chat."""
+    groups = _exchanges(history)
+    step = max(1, int(block))
+    k = 0
+    while groups[k:] and _history_cost([item for group in groups[k:] for item in group]) > max_cost:
+        k += step
+    return [item for group in groups[k:] for item in group]
+
+
+def history_trim_block(config: dict) -> int:
+    return max(1, int(config.get("budgets", {}).get("history_trim_block", 4)))
 
 
 def _trim_text(text: str, cap: int) -> str:
@@ -106,6 +112,7 @@ def fit_input(
     max_tokens: int,
     num_ctx: int,
     caps: dict | None = None,
+    block: int = 4,
 ) -> Fitted:
     limit = max(1, int((num_ctx - max_tokens) * 0.9))
     kept = [dict(item) for item in history]
@@ -124,15 +131,13 @@ def fit_input(
             _mark(trimmed, "handoff")
         history_cap = caps.get("history")
         if history_cap is not None and _history_cost(kept) > int(history_cap):
-            _cut_history(kept, int(history_cap) // 2)
+            kept = _trim_exchanges(kept, int(history_cap), block)
             _mark(trimmed, "history")
 
-    while kept and _cost(system, kept, rag, handoff, user) > limit:
-        before = len(kept)
-        _cut_history(kept, _history_cost(kept) // 2)
+    allowance = limit - _cost(system, [], rag, handoff, user)
+    if kept and _cost(system, kept, rag, handoff, user) > limit:
+        kept = _trim_exchanges(kept, allowance, block)
         _mark(trimmed, "history")
-        if len(kept) == before:
-            break
 
     if rag and _cost(system, kept, rag, handoff, user) > limit:
         rag = _shorten(rag, lambda text: _cost(system, kept, text, handoff, user), limit)
@@ -168,6 +173,7 @@ def assemble_messages(
     max_tokens: int,
     num_ctx: int,
     caps: dict | None = None,
+    block: int = 4,
 ) -> list[dict]:
     fitted = fit_input(
         system=system,
@@ -178,13 +184,17 @@ def assemble_messages(
         max_tokens=max_tokens,
         num_ctx=num_ctx,
         caps=caps,
+        block=block,
     )
-    if fitted.trimmed:
+    if "history" in fitted.trimmed:
+        log.info("trimmed history num_ctx=%s max_tokens=%s", num_ctx, max_tokens)
+    rest = [part for part in fitted.trimmed if part != "history"]
+    if rest:
         log.warning(
             "trimmed input to fit num_ctx=%s max_tokens=%s parts=%s",
             num_ctx,
             max_tokens,
-            ",".join(fitted.trimmed),
+            ",".join(rest),
         )
     messages = [{"role": "system", "content": fitted.system}] if fitted.system else []
     messages.extend({"role": item["role"], "content": item.get("content", "")} for item in fitted.history)

@@ -19,7 +19,14 @@ from typing import TypedDict
 import requests
 from langgraph.graph import END, StateGraph
 
-from jarvis.budget import REFERENCE_RULE, answer_token_budget, assemble_messages, context_window, token_caps
+from jarvis.budget import (
+    REFERENCE_RULE,
+    answer_token_budget,
+    assemble_messages,
+    context_window,
+    history_trim_block,
+    token_caps,
+)
 from jarvis.config import settings
 from jarvis.policy import decide
 from jarvis.registry import current_snapshot
@@ -310,6 +317,7 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
         max_tokens=token_budget,
         num_ctx=context_window(settings.topology, model),
         caps=token_caps(settings.topology),
+        block=history_trim_block(settings.topology),
     )
     result_text = traced_stream_call(
         model,

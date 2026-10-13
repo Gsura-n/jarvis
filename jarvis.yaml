@@ -81,6 +81,8 @@ budgets:
     rag: 1500
     handoff: 2500
     answer: {large: 6000, small: 4000}
+  # Drop this many oldest exchanges at once, counted from the start of the chat.
+  history_trim_block: 4
   # tiers[*].num_ctx is the only context window. context_window() reads that.
 
 guards:
