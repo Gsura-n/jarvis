@@ -23,6 +23,7 @@ import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
+from starlette.middleware.cors import CORSMiddleware
 
 from jarvis.budget import (
     REFERENCE_RULE,
@@ -105,61 +106,6 @@ async def _lifespan(_app: FastAPI):
             await task
         set_registry(None)
 
-
-class _CorsAllowlist:
-    """Echo Access-Control-Allow-Origin only for origins listed in JARVIS_CORS_ORIGINS.
-
-    Credentials stay off: clients send a bearer header, not cookies. The list is read
-    on each request so a changed env applies without rebuilding the app.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        origin = _header(scope, b"origin")
-        allowed = bool(origin) and origin in cors_origins()
-        if scope["method"] == "OPTIONS" and origin:
-            await _preflight(send, origin, allowed)
-            return
-
-        async def send_with_origin(message):
-            if allowed and message["type"] == "http.response.start":
-                headers = list(message.get("headers") or [])
-                headers.append((b"access-control-allow-origin", origin.encode("latin-1")))
-                headers.append((b"vary", b"Origin"))
-                message = {**message, "headers": headers}
-            await send(message)
-
-        await self.app(scope, receive, send_with_origin)
-
-
-def _header(scope, name: bytes) -> str:
-    for key, value in scope.get("headers", []):
-        if key == name:
-            return value.decode("latin-1")
-    return ""
-
-
-async def _preflight(send, origin: str, allowed: bool) -> None:
-    headers = [(b"vary", b"Origin"), (b"content-length", b"0")]
-    if allowed:
-        headers.extend(
-            [
-                (b"access-control-allow-origin", origin.encode("latin-1")),
-                (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
-                (b"access-control-allow-headers", b"Authorization, Content-Type"),
-            ]
-        )
-    await send({"type": "http.response.start", "status": 204, "headers": headers})
-    await send({"type": "http.response.body", "body": b""})
-
-
-app = FastAPI(title="Jarvis Smart Gateway", lifespan=_lifespan)
-app.add_middleware(_CorsAllowlist)
 
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
 try:
@@ -478,9 +424,13 @@ def execute(
 def require_api_key(request: Request) -> None:
     """Shared key check. There are no roles yet: missing or wrong key is 401."""
     expected = jarvis_api_key()
-    header = request.headers.get("authorization", "")
-    token = header[7:] if header.startswith("Bearer ") else ""
-    if not expected or not hmac.compare_digest(token, expected):
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    ok = (
+        scheme.lower() == "bearer"
+        and bool(expected)
+        and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
+    )
+    if not ok:
         raise HTTPException(status_code=401, detail="missing or invalid api key")
 
 
@@ -687,7 +637,6 @@ def list_devices():
     return current_snapshot().as_dict()
 
 
-@app.get("/health")
 def health():
     return {"status": "ok", "gateway": "jarvis", "port": 4001}
 
@@ -716,7 +665,28 @@ def api_config():
     return {"status": "ok", "name": "Jarvis Gateway", "version": "1.0.0"}
 
 
-app.include_router(api)
+def create_app() -> FastAPI:
+    """Build the gateway. CORS origins are fixed at build time, so tests call this after setenv."""
+    application = FastAPI(
+        title="Jarvis Smart Gateway",
+        lifespan=_lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins(),
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+    application.include_router(api)
+    application.add_api_route("/health", health, methods=["GET"])
+    return application
+
+
+app = create_app()
 
 
 if __name__ == "__main__":

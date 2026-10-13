@@ -1,5 +1,6 @@
 """Every gateway route except GET /health requires JARVIS_API_KEY. CORS lists origins."""
 
+import asyncio
 import logging
 import os
 
@@ -83,7 +84,9 @@ def test_cors_origins_split_on_commas(monkeypatch):
 def test_cors_preflight_only_echoes_listed_origins(monkeypatch):
     monkeypatch.setenv("JARVIS_CORS_ORIGINS", "http://openwebui.local:8080")
     monkeypatch.delenv("JARVIS_API_KEY", raising=False)
-    with _client(monkeypatch) as client:
+    from jarvis.gateway import create_app
+
+    with _client(monkeypatch, app=create_app()) as client:
         blocked = client.options(
             "/v1/models",
             headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "GET"},
@@ -95,3 +98,54 @@ def test_cors_preflight_only_echoes_listed_origins(monkeypatch):
     assert "access-control-allow-origin" not in blocked.headers
     assert allowed.headers.get("access-control-allow-origin") == "http://openwebui.local:8080"
     assert allowed.headers.get("access-control-allow-credentials") is None
+
+
+def test_builtin_docs_are_not_mounted(monkeypatch):
+    monkeypatch.setenv("JARVIS_API_KEY", KEY)
+    with _client(monkeypatch) as client:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            assert client.get(path).status_code == 404
+            assert client.get(path, headers=BEARER).status_code == 404
+
+
+def test_bearer_scheme_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("JARVIS_API_KEY", KEY)
+    with _client(monkeypatch) as client:
+        assert client.get("/v1/models", headers={"Authorization": f"bearer {KEY}"}).status_code == 200
+        assert client.get("/v1/models", headers={"Authorization": f"BEARER {KEY}"}).status_code == 200
+        assert client.get("/v1/models", headers={"Authorization": f"Basic {KEY}"}).status_code == 401
+
+
+def test_non_ascii_token_is_401(monkeypatch):
+    monkeypatch.setenv("JARVIS_API_KEY", KEY)
+    from jarvis.gateway import app
+
+    async def status() -> int:
+        seen = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            seen.append(message)
+
+        await app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/v1/models",
+                "raw_path": b"/v1/models",
+                "query_string": b"",
+                "headers": [(b"authorization", b"Bearer caff\xff")],
+                "client": ("127.0.0.1", 50000),
+                "server": ("testserver", 80),
+            },
+            receive,
+            send,
+        )
+        return seen[0]["status"]
+
+    assert asyncio.run(status()) == 401

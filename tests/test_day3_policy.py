@@ -95,7 +95,7 @@ def test_nothing_available_still_names_the_mini_fallback():
     assert decision.reason
 
 
-def _client(monkeypatch, offline=False):
+def _client(monkeypatch, offline=False, app=None):
     """Lifespan polls through this stub, so the test never touches the LAN."""
 
     async def fetch(url: str, timeout: float) -> dict:
@@ -108,7 +108,8 @@ def _client(monkeypatch, offline=False):
     monkeypatch.setattr("jarvis.registry.fetch_json", fetch)
     from fastapi.testclient import TestClient
 
-    from jarvis.gateway import app
+    if app is None:
+        from jarvis.gateway import app
 
     return TestClient(app)
 
