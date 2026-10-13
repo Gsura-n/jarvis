@@ -12,6 +12,8 @@ OpenAI-compatible API that orchestrates:
 import asyncio
 import hmac
 import json
+import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
@@ -29,6 +31,8 @@ from jarvis.gateway_metrics import StepTimer
 from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
 from jarvis.registry import Registry, bind_snapshot, current_snapshot, mini_only, reset_snapshot, set_registry
 from jarvis.task_decomposer import decompose_and_execute
+
+log = logging.getLogger("jarvis.gateway")
 
 # ── Config — everything comes from jarvis.config (env file + jarvis.yaml) ─────
 LITELLM_BASE = settings.litellm_base
@@ -197,28 +201,72 @@ def chat(
 
 
 def chat_stream(model_alias: str, messages: list, temperature: float = 0.3, max_tokens: int | None = None):
-    """Streaming chat — yields tokens as they arrive from LiteLLM."""
+    """Streaming chat. Closing this generator closes the HTTP connection, which stops Ollama."""
     payload = {"model": model_alias, "messages": messages, "temperature": temperature, "stream": True}
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
-    r = requests.post(
+    skipped = 0
+    with requests.post(
         f"{LITELLM_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {LITELLM_KEY}"},
         json=payload,
         timeout=600,
         stream=True,
-    )
-    for line in r.iter_lines():
-        if line:
+    ) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            if not line:
+                continue
             decoded = line.decode("utf-8")
-            if decoded.startswith("data: ") and decoded != "data: [DONE]":
+            if not decoded.startswith("data: ") or decoded == "data: [DONE]":
+                continue
+            try:
+                chunk = json.loads(decoded[6:])
+                delta = chunk["choices"][0]["delta"].get("content", "")
+            except Exception:
+                skipped += 1
+                continue
+            if delta:
+                yield delta
+    if skipped:
+        log.warning("skipped %s unreadable stream lines deployment=%s", skipped, model_alias)
+
+
+async def stream_tokens(deployment: str, device: str, messages: list, max_tokens: int):
+    """Yield tokens for one heavy call. Stop closes the model stream and then releases the semaphore."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    stop = threading.Event()
+
+    def produce():
+        stream = chat_stream(deployment, messages, max_tokens=max_tokens)
+        try:
+            while not stop.is_set():
                 try:
-                    chunk = json.loads(decoded[6:])
-                    delta = chunk["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        yield delta
-                except Exception:
-                    pass
+                    token = next(stream)
+                except StopIteration:
+                    break
+                if stop.is_set():
+                    break
+                asyncio.run_coroutine_threadsafe(queue.put(token), loop).result()
+        finally:
+            stream.close()
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+
+    async with device_semaphore(device):
+        worker = asyncio.create_task(asyncio.to_thread(produce))
+        try:
+            while True:
+                token = await queue.get()
+                if token is None:
+                    break
+                yield token
+        finally:
+            stop.set()
+            try:
+                await worker
+            except Exception:
+                log.exception("stream worker failed deployment=%s", deployment)
 
 
 # ── Step 1 — Enhance + Classify ───────────────────────────────────────────────
@@ -523,31 +571,19 @@ async def completions(request: Request):
             decision.deployment, system_msg, enhanced_prompt, rag_context, history
         )
         msg_id = f"jarvis-{int(time.time())}"
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-
-        def produce():
-            try:
-                for token in chat_stream(decision.deployment, stream_messages, max_tokens=max_tokens):
-                    asyncio.run_coroutine_threadsafe(queue.put(token), loop).result()
-            finally:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
 
         async def stream_generator():
-            async with device_semaphore(decision.device):
-                worker = asyncio.create_task(asyncio.to_thread(produce))
-                try:
-                    while (token := await queue.get()) is not None:
-                        chunk = {
-                            "id": msg_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": "jarvis",
-                            "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                finally:
-                    await worker
+            async for token in stream_tokens(
+                decision.deployment, decision.device, stream_messages, max_tokens
+            ):
+                chunk = {
+                    "id": msg_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "jarvis",
+                    "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
