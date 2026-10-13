@@ -34,11 +34,12 @@ model_list:
       api_base: http://localhost:11434
       num_ctx: 8192
 
+  # deepseek-r1:8b is used only here. Same model elsewhere must share this num_ctx or Ollama reloads it.
   - model_name: reasoning-large-mini
     litellm_params:
       model: ollama/deepseek-r1:8b
       api_base: http://localhost:11434
-      num_ctx: 8192
+      num_ctx: 16384
 
   - model_name: judge-mini
     litellm_params:

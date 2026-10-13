@@ -295,7 +295,10 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
 
     print(f"   → [{subtask['id']}] {subtask['task'][:50]}... ({model}) {tag}")
     token_budget = answer_token_budget(model, settings.topology)
-    wall_limit = 420 if "-large" in model else 300
+    walls = settings.topology.get("budgets", {}).get("subtask_wall_s", {})
+    # A degraded -large fallback is still slow, so it keeps the longer clock.
+    wall_key = "large" if "-large" in model else "small"
+    wall_limit = int(walls.get(wall_key, 420 if wall_key == "large" else 300))
     messages = assemble_messages(
         system=system,
         history=[],
