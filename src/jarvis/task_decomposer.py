@@ -117,7 +117,7 @@ Respond ONLY with valid JSON:
 def detect_complexity(state: JarvisState) -> JarvisState:
     print(f"\n🔍 Detecting complexity for: {state['prompt'][:80]}...")
     try:
-        result = call_model("general", COMPLEXITY_SYSTEM, state["prompt"], temperature=0.1)
+        result = call_model("general-small-mini", COMPLEXITY_SYSTEM, state["prompt"], temperature=0.1)
         parsed = parse_json(result)
         complexity = parsed.get("complexity", "simple")
         reasoning = parsed.get("reasoning", "")
@@ -182,7 +182,7 @@ def split_tasks(state: JarvisState) -> JarvisState:
     print("\n📋 Splitting into subtasks...")
     try:
         result = call_model(
-            "general",
+            "general-small-mini",
             SPLITTER_SYSTEM,
             f"Original prompt: {state['prompt']}\n\nContext: {state['reasoning']}",
             temperature=0.2,
@@ -221,9 +221,9 @@ def split_tasks(state: JarvisState) -> JarvisState:
 
 # ── Node 3 — Parallel Task Executor with Structured Handoff ───────────────────
 INTENT_TO_MODEL = {
-    "code": "coding",
-    "reasoning": "reasoning",
-    "general": "general",
+    "code": "code-small-mini",
+    "reasoning": "reasoning-large-mini",
+    "general": "general-small-mini",
 }
 
 INTENT_SYSTEM = {
@@ -257,7 +257,7 @@ def is_broken_result(text: str) -> bool:
 def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict:
     """Execute one subtask. Used by both parallel and sequential paths."""
     intent = subtask.get("intent", "general")
-    model = INTENT_TO_MODEL.get(intent, "general")
+    model = INTENT_TO_MODEL.get(intent, "general-small-mini")
     implements = subtask.get("implements")
     if isinstance(implements, list):
         implements = implements[0] if implements else None
@@ -420,7 +420,7 @@ def smart_compress(result: dict) -> str:
         for i, block in enumerate(code_blocks):
             prose = prose.replace(block, f"__CODE_BLOCK_{i}__")
         if len(prose) > 600:
-            prose = call_model("general", PROSE_COMPRESS_SYSTEM, prose, temperature=0.1)
+            prose = call_model("general-small-mini", PROSE_COMPRESS_SYSTEM, prose, temperature=0.1)
         # restore code blocks
         for i, block in enumerate(code_blocks):
             prose = prose.replace(f"__CODE_BLOCK_{i}__", f"\n{block}\n")
@@ -430,12 +430,12 @@ def smart_compress(result: dict) -> str:
     if result["intent"] == "reasoning":
         if len(text) < 800:
             return text
-        return call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+        return call_model("general-small-mini", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
 
     # General — compress more aggressively
     if len(text) < 400:
         return text
-    return call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+    return call_model("general-small-mini", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
 
 
 def aggregate_results(state: JarvisState) -> JarvisState:
@@ -488,7 +488,7 @@ def aggregate_results(state: JarvisState) -> JarvisState:
             f"Running synthesis so far:\n{synthesis}\n\n"
             f"New subtask result to integrate:\n## {c['task']}\n{c['content']}"
         )
-        synthesis = call_model("general", SYNTHESIS_SYSTEM, synthesis_input, temperature=0.2)
+        synthesis = call_model("general-small-mini", SYNTHESIS_SYSTEM, synthesis_input, temperature=0.2)
 
     print(f"   ✅ Final answer ({len(synthesis)} chars)")
     return {**state, "final_answer": synthesis}
@@ -539,7 +539,7 @@ def decompose_and_execute(prompt: str, rag_context: str = "") -> dict:
     }
     final_state = graph.invoke(initial_state)
     models_used = list(
-        set(INTENT_TO_MODEL.get(r["intent"], "general") for r in final_state.get("results", []))
+        set(INTENT_TO_MODEL.get(r["intent"], "general-small-mini") for r in final_state.get("results", []))
     )
     return {
         "answer": final_state.get("final_answer", ""),

@@ -44,10 +44,11 @@ if _missing:
     print(f"⚠️  Missing required env vars: {', '.join(_missing)}")
     print(f"   Add them to {settings.env_file}")
 
+# Concrete deployment names from jarvis.yaml. policy.decide() replaces this map next.
 MODELS = {
-    "general": "general",
-    "code": "coding",
-    "reasoning": "reasoning",
+    "general": "general-small-mini",
+    "code": "code-small-mini",
+    "reasoning": "reasoning-large-mini",
 }
 
 TRACE_TRIGGERS = [
@@ -243,7 +244,7 @@ def enhance_and_classify(user_message: str) -> dict:
 
     try:
         result = chat(
-            "classifier",
+            "classify-mini",
             [
                 {"role": "system", "content": ENHANCE_SYSTEM},
                 {"role": "user", "content": user_message},

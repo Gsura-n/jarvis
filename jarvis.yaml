@@ -44,26 +44,26 @@ registry:
   online_after_successes: 1
 
 # Tiers are what the policy engine reasons about. Each tier lists candidate
-# deployments in preference order; the first one whose device is online,
-# has the model pulled, and has memory headroom wins. LiteLLM deployment
-# names match configs/litellm.yaml.
+# deployments in preference order; the first one whose device is online and
+# has the model pulled wins. litellm names match configs/litellm.yaml.
+# num_ctx is sent to Ollama through that file. Mini models are 8192; the 30B is 32768.
 tiers:
   classify:
-    - {device: mini, model: llama3.2:3b, litellm: classifier, num_ctx: 8192, resident: true}
+    - {device: mini, model: llama3.2:3b, litellm: classify-mini, num_ctx: 8192, resident: true}
   embed:
     - {device: mini, model: nomic-embed-text, litellm: embed-mini, num_ctx: 8192, resident: true}
   general-small:
-    - {device: mini, model: llama3.1:8b, litellm: general, num_ctx: 8192}
+    - {device: mini, model: llama3.1:8b, litellm: general-small-mini, num_ctx: 8192}
   code-small:
-    - {device: mini, model: qwen2.5-coder:7b, litellm: coding, num_ctx: 8192}
+    - {device: mini, model: qwen2.5-coder:7b, litellm: code-small-mini, num_ctx: 8192}
   reasoning-large:
-    - {device: macbook-pro, model: qwen3:30b-a3b-instruct-2507-q4_K_M, litellm: large-mbp, num_ctx: 32768}
-    - {device: mini, model: deepseek-r1:8b, litellm: reasoning, num_ctx: 8192, degraded: true}
+    - {device: macbook-pro, model: qwen3:30b-a3b-instruct-2507-q4_K_M, litellm: reasoning-large-mbp, num_ctx: 32768}
+    - {device: mini, model: deepseek-r1:8b, litellm: reasoning-large-mini, num_ctx: 8192, degraded: true}
   code-large:
-    - {device: macbook-pro, model: qwen3:30b-a3b-instruct-2507-q4_K_M, litellm: large-mbp, num_ctx: 32768}
-    - {device: mini, model: qwen2.5-coder:7b, litellm: coding, num_ctx: 8192, degraded: true}
+    - {device: macbook-pro, model: qwen3:30b-a3b-instruct-2507-q4_K_M, litellm: code-large-mbp, num_ctx: 32768}
+    - {device: mini, model: qwen2.5-coder:7b, litellm: code-large-mini, num_ctx: 8192, degraded: true}
   judge:
-    - {device: mini, model: llama3.1:8b, litellm: general, num_ctx: 8192}
+    - {device: mini, model: llama3.1:8b, litellm: judge-mini, num_ctx: 8192}
 
 # Not in the routing mix on purpose: qwen2.5-coder:14b on macbook-pro.
 # It exists for benchmarks and emergency fallback only; loading it beside
