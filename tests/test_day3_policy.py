@@ -4,6 +4,8 @@ import os
 
 os.environ.setdefault("JARVIS_ENV_FILE", "/nonexistent/.jarvis.env")
 
+import pytest  # noqa: E402
+
 from jarvis.config import settings  # noqa: E402
 from jarvis.policy import decide, prefer_decomposer, walk_tier  # noqa: E402
 
@@ -111,10 +113,18 @@ def _client(monkeypatch, offline=False):
     return TestClient(app)
 
 
-def _post(client, content, model="jarvis"):
+@pytest.fixture
+def auth_headers(monkeypatch):
+    """Shared key the gateway tests send. The route reads JARVIS_API_KEY on each request."""
+    monkeypatch.setenv("JARVIS_API_KEY", "test-key")
+    return {"Authorization": "Bearer test-key"}
+
+
+def _post(client, content, model="jarvis", headers=None):
     return client.post(
         "/v1/chat/completions",
         json={"model": model, "messages": [{"role": "user", "content": content}]},
+        headers=headers,
     )
 
 
@@ -122,39 +132,39 @@ def _refuse(*_args, **_kwargs):
     raise AssertionError("this call should not happen")
 
 
-def test_explicit_coding_skips_the_classifier(monkeypatch):
+def test_explicit_coding_skips_the_classifier(monkeypatch, auth_headers):
     monkeypatch.setattr("jarvis.gateway.enhance_and_classify", _refuse)
     monkeypatch.setattr("jarvis.gateway.chat", lambda model, *_a, **_k: f"from {model}")
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     with _client(monkeypatch) as client:
-        response = _post(client, "print hello", model="coding")
+        response = _post(client, "print hello", model="coding", headers=auth_headers)
     assert response.status_code == 200
     assert "from code-small-mini" in response.json()["choices"][0]["message"]["content"]
 
 
-def test_reasoning_trace_names_the_laptop_when_it_is_online(monkeypatch):
+def test_reasoning_trace_names_the_laptop_when_it_is_online(monkeypatch, auth_headers):
     monkeypatch.setattr("jarvis.gateway.chat", lambda *_a, **_k: "done")
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     with _client(monkeypatch) as client:
-        response = _post(client, "which model answered that?", model="reasoning")
+        response = _post(client, "which model answered that?", model="reasoning", headers=auth_headers)
     text = response.json()["choices"][0]["message"]["content"]
     assert "Device: `macbook-pro`" in text
     assert "Deployment: `reasoning-large-mbp`" in text
     assert "Degraded: `false`" in text
 
 
-def test_offline_laptop_answers_from_the_mini(monkeypatch):
+def test_offline_laptop_answers_from_the_mini(monkeypatch, auth_headers):
     monkeypatch.setattr("jarvis.gateway.chat", lambda model, *_a, **_k: f"from {model}")
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     with _client(monkeypatch, offline=True) as client:
-        response = _post(client, "which model answered that?", model="reasoning")
+        response = _post(client, "which model answered that?", model="reasoning", headers=auth_headers)
     text = response.json()["choices"][0]["message"]["content"]
     assert "from reasoning-large-mini" in text
     assert "Device: `mini`" in text
     assert "Degraded: `true`" in text
 
 
-def test_degraded_design_and_build_uses_the_decomposer(monkeypatch):
+def test_degraded_design_and_build_uses_the_decomposer(monkeypatch, auth_headers):
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     monkeypatch.setattr(
         "jarvis.gateway.enhance_and_classify",
@@ -166,15 +176,15 @@ def test_degraded_design_and_build_uses_the_decomposer(monkeypatch):
     )
     monkeypatch.setattr("jarvis.gateway.chat", _refuse)
     with _client(monkeypatch, offline=True) as client:
-        response = _post(client, "design and build a todo api")
+        response = _post(client, "design and build a todo api", headers=auth_headers)
     text = response.json()["choices"][0]["message"]["content"]
     assert "partial" in text
     assert "Decomposed into 1 subtasks" in text
 
 
-def test_model_list_includes_trace_and_decompose(monkeypatch):
+def test_model_list_includes_trace_and_decompose(monkeypatch, auth_headers):
     with _client(monkeypatch) as client:
-        names = {item["id"] for item in client.get("/v1/models").json()["data"]}
+        names = {item["id"] for item in client.get("/v1/models", headers=auth_headers).json()["data"]}
     assert "jarvis-trace" in names
     assert "jarvis-decompose" in names
 

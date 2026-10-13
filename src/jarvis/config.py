@@ -39,6 +39,12 @@ def jarvis_api_key() -> str:
     return os.getenv("JARVIS_API_KEY", "")
 
 
+def cors_origins() -> list[str]:
+    """Browser origins allowed to call the gateway. Empty when JARVIS_CORS_ORIGINS is unset."""
+    raw = os.getenv("JARVIS_CORS_ORIGINS", "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _expand(p: str | Path) -> Path:
     p = Path(p).expanduser()
     return p if p.is_absolute() else (REPO_ROOT / p)
