@@ -125,6 +125,14 @@ def context_window(config: dict, deployment: str) -> int:
 
 
 def answer_token_budget(deployment: str, config: dict) -> int:
+    """Reserve the large answer budget only when the window can hold it.
+
+    A name like reasoning-large-mini used to take 6000 tokens inside an 8192
+    window, which left no room for history. The window size decides, and the
+    reservation never exceeds half of num_ctx.
+    """
     answer = config.get("budgets", {}).get("tokens", {}).get("answer", {})
-    large = deployment in {"reasoning", "large-mbp"} or "-large" in deployment
-    return int(answer.get("large" if large else "small", 6000 if large else 4000))
+    num_ctx = context_window(config, deployment)
+    large = num_ctx >= 16384
+    budget = int(answer.get("large" if large else "small", 6000 if large else 4000))
+    return min(budget, num_ctx // 2)
