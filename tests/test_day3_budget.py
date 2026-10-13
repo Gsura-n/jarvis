@@ -5,7 +5,14 @@ from pathlib import Path
 
 import yaml
 
-from jarvis.budget import _cost, assemble_messages, estimate_tokens, fit_input
+from jarvis.budget import (
+    _cost,
+    answer_token_budget,
+    assemble_messages,
+    context_window,
+    estimate_tokens,
+    fit_input,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,6 +34,50 @@ def test_every_jarvis_deployment_has_num_ctx_and_a_litellm_entry():
             assert isinstance(cand.get("num_ctx"), int) and cand["num_ctx"] >= 8192, tier
             assert cand["litellm"] in lite, cand["litellm"]
             assert lite[cand["litellm"]]["litellm_params"]["num_ctx"] == cand["num_ctx"]
+
+
+def _chars(tokens: int) -> str:
+    return "x" * (tokens * 4 - 3)
+
+
+def test_answer_budget_is_at_most_half_the_context_window():
+    config = _yaml("jarvis.yaml")
+    for _tier, candidates in config["tiers"].items():
+        for cand in candidates:
+            budget = answer_token_budget(cand["litellm"], config)
+            assert budget <= cand["num_ctx"] // 2, cand["litellm"]
+    assert answer_token_budget("reasoning-large-mbp", config) == 6000
+    assert context_window(config, "reasoning-large-mbp") == 32768
+    assert answer_token_budget("reasoning-large-mini", config) == 6000
+    assert context_window(config, "reasoning-large-mini") == 16384
+    assert answer_token_budget("code-large-mini", config) == 4000
+    assert context_window(config, "code-large-mini") == 8192
+    assert answer_token_budget("code-small-mini", config) == 4000
+    assert context_window(config, "code-small-mini") == 8192
+
+
+def test_code_large_mini_keeps_history_beside_a_full_rag_block():
+    config = _yaml("jarvis.yaml")
+    num_ctx = context_window(config, "code-large-mini")
+    max_tokens = answer_token_budget("code-large-mini", config)
+    rag = _chars(1500)
+    history = [
+        {"role": "user", "content": _chars(1000)},
+        {"role": "assistant", "content": _chars(1000)},
+    ]
+    assert estimate_tokens(rag) == 1500
+    assert sum(estimate_tokens(item["content"]) for item in history) == 2000
+    fitted = fit_input(
+        system="s",
+        history=history,
+        rag=rag,
+        handoff="",
+        user="q",
+        max_tokens=max_tokens,
+        num_ctx=num_ctx,
+    )
+    assert fitted.trimmed == ()
+    assert [item["content"] for item in fitted.history] == [item["content"] for item in history]
 
 
 def test_oldest_history_is_dropped_before_newer_history():
