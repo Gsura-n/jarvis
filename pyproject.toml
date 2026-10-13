@@ -8,6 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "Gauttam Suraneni" }]
 dependencies = [
   "fastapi>=0.115",
+  "httpx>=0.28",
   "uvicorn[standard]>=0.30",
   "requests>=2.32",
   "neo4j>=5.20",
