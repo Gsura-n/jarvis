@@ -1,5 +1,6 @@
 # LiteLLM proxy config. Secrets are pulled from the environment (loaded from ~/.jarvis.env by scripts/start.sh).
-# Deployment names are <tier>-<device>; the gateway's policy engine picks among them (see jarvis.yaml).
+# Deployment names match jarvis.yaml. num_ctx is an Ollama option: LiteLLM copies
+# it into the request options, which is what sets the context window.
 
 model_list:
   # ── Mac mini (small tier) ──────────────────────────────────────────────
@@ -7,27 +8,38 @@ model_list:
     litellm_params:
       model: ollama/llama3.2:3b
       api_base: http://localhost:11434
+      num_ctx: 8192
+
+  - model_name: embed-mini
+    litellm_params:
+      model: ollama/nomic-embed-text
+      api_base: http://localhost:11434
+      num_ctx: 8192
 
   - model_name: general
     litellm_params:
       model: ollama/llama3.1:8b
       api_base: http://localhost:11434
+      num_ctx: 8192
 
   - model_name: coding
     litellm_params:
       model: ollama/qwen2.5-coder:7b
       api_base: http://localhost:11434
+      num_ctx: 8192
 
   - model_name: reasoning
     litellm_params:
       model: ollama/deepseek-r1:8b
       api_base: http://localhost:11434
+      num_ctx: 8192
 
-  # ── MacBook Pro (large tier) — wired into routing in week 3 ────────────
+  # ── MacBook Pro (large tier) ───────────────────────────────────────────
   - model_name: large-mbp
     litellm_params:
       model: ollama/qwen3:30b-a3b-instruct-2507-q4_K_M
       api_base: http://10.0.0.47:11434
+      num_ctx: 32768
 
 router_settings:
   routing_strategy: simple-shuffle

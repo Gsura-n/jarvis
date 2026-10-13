@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
 
+from jarvis.budget import answer_token_budget, assemble_messages, context_window
 from jarvis.config import settings
 from jarvis.gateway_metrics import StepTimer
 from jarvis.task_decomposer import decompose_and_execute
@@ -131,13 +132,22 @@ def rag_query(question: str, top_k: int = 4) -> str:
 
 
 # ── LiteLLM helpers ───────────────────────────────────────────────────────────
-def chat(model_alias: str, messages: list, temperature: float = 0.3, _retry: bool = True) -> str:
+def chat(
+    model_alias: str,
+    messages: list,
+    temperature: float = 0.3,
+    max_tokens: int | None = None,
+    _retry: bool = True,
+) -> str:
     """Non-streaming chat — returns full response string. Retries once on failure."""
+    payload = {"model": model_alias, "messages": messages, "temperature": temperature}
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     try:
         r = requests.post(
             f"{LITELLM_BASE}/chat/completions",
             headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-            json={"model": model_alias, "messages": messages, "temperature": temperature},
+            json=payload,
             timeout=600,
         )
         r.raise_for_status()
@@ -146,16 +156,19 @@ def chat(model_alias: str, messages: list, temperature: float = 0.3, _retry: boo
         if _retry:
             print(f"[chat] {model_alias} failed ({e}) — retrying once...")
             time.sleep(2)
-            return chat(model_alias, messages, temperature, _retry=False)
+            return chat(model_alias, messages, temperature, max_tokens, _retry=False)
         raise
 
 
-def chat_stream(model_alias: str, messages: list, temperature: float = 0.3):
+def chat_stream(model_alias: str, messages: list, temperature: float = 0.3, max_tokens: int | None = None):
     """Streaming chat — yields tokens as they arrive from LiteLLM."""
+    payload = {"model": model_alias, "messages": messages, "temperature": temperature, "stream": True}
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     r = requests.post(
         f"{LITELLM_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-        json={"model": model_alias, "messages": messages, "temperature": temperature, "stream": True},
+        json=payload,
         timeout=600,
         stream=True,
     )
@@ -252,80 +265,106 @@ def enhance_and_classify(user_message: str) -> dict:
     return parsed
 
 
+def prior_turns(messages: list, user_msg: str) -> list[dict]:
+    """Turns before the latest copy of the current user message."""
+    last = None
+    for index, message in enumerate(messages):
+        if message.get("role") == "user" and message.get("content") == user_msg:
+            last = index
+    if last is None:
+        return []
+    return [
+        {"role": message["role"], "content": message["content"]}
+        for message in messages[:last]
+        if message.get("role") in ("user", "assistant") and isinstance(message.get("content"), str)
+    ]
+
+
+def budgeted_messages(
+    alias: str, system: str, user: str, rag: str = "", history: list | None = None, handoff: str = ""
+):
+    max_tokens = answer_token_budget(alias, settings.topology)
+    messages = assemble_messages(
+        system=system,
+        history=history or [],
+        rag=rag,
+        handoff=handoff,
+        user=user,
+        max_tokens=max_tokens,
+        num_ctx=context_window(settings.topology, alias),
+    )
+    return messages, max_tokens
+
+
 # ── Step 2 — Execute (non-streaming) ─────────────────────────────────────────
-def execute(intent: str, enhanced_prompt: str, rag_context: str, tracker: StepTimer) -> tuple[str, list[str]]:
+def execute(
+    intent: str,
+    enhanced_prompt: str,
+    rag_context: str,
+    tracker: StepTimer,
+    history: list | None = None,
+) -> tuple[str, list[str]]:
     system_base = "You are a helpful expert assistant."
-    if rag_context:
-        system_base += f"\n\n{rag_context}"
+    history = history or []
 
     if intent == "general":
         tracker.start("llm_general")
-        answer = chat(
-            "general",
-            [
-                {"role": "system", "content": system_base},
-                {"role": "user", "content": enhanced_prompt},
-            ],
+        messages, max_tokens = budgeted_messages(
+            "general", system_base, enhanced_prompt, rag_context, history
         )
+        answer = chat("general", messages, max_tokens=max_tokens)
         tracker.end("llm_general")
         return answer, ["general (llama3.1:8b)"]
 
     if intent == "code":
         tracker.start("llm_code")
-        answer = chat(
+        messages, max_tokens = budgeted_messages(
             "coding",
-            [
-                {
-                    "role": "system",
-                    "content": system_base + "\nWrite clean, production-ready code with comments.",
-                },
-                {"role": "user", "content": enhanced_prompt},
-            ],
+            system_base + "\nWrite clean, production-ready code with comments.",
+            enhanced_prompt,
+            rag_context,
+            history,
         )
+        answer = chat("coding", messages, max_tokens=max_tokens)
         tracker.end("llm_code")
         return answer, ["coding (qwen2.5-coder:7b)"]
 
     if intent == "reasoning":
         tracker.start("llm_reasoning")
-        answer = chat(
+        messages, max_tokens = budgeted_messages(
             "reasoning",
-            [
-                {"role": "system", "content": system_base + "\nThink step by step. Be thorough."},
-                {"role": "user", "content": enhanced_prompt},
-            ],
+            system_base + "\nThink step by step. Be thorough.",
+            enhanced_prompt,
+            rag_context,
+            history,
         )
+        answer = chat("reasoning", messages, max_tokens=max_tokens)
         tracker.end("llm_reasoning")
         return answer, ["reasoning (deepseek-r1:8b)"]
 
     if intent == "code+reasoning":
         tracker.start("llm_reasoning")
-        reasoning_answer = chat(
+        messages, max_tokens = budgeted_messages(
             "reasoning",
-            [
-                {
-                    "role": "system",
-                    "content": system_base + "\nThink step by step. Produce a clear solution design.",
-                },
-                {"role": "user", "content": enhanced_prompt},
-            ],
+            system_base + "\nThink step by step. Produce a clear solution design.",
+            enhanced_prompt,
+            rag_context,
+            history,
         )
+        reasoning_answer = chat("reasoning", messages, max_tokens=max_tokens)
         tracker.end("llm_reasoning")
 
         tracker.start("llm_code")
-        coding_prompt = (
-            f"Based on this solution design:\n\n{reasoning_answer}\n\n"
-            f"Now implement the code for:\n{enhanced_prompt}"
-        )
-        code_answer = chat(
+        coding_prompt = f"Based on this solution design:\n\n{reasoning_answer}\n\nNow implement the code for:\n{enhanced_prompt}"
+        messages, max_tokens = budgeted_messages(
             "coding",
-            [
-                {
-                    "role": "system",
-                    "content": system_base + "\nWrite clean, production-ready code with comments.",
-                },
-                {"role": "user", "content": coding_prompt},
-            ],
+            system_base + "\nWrite clean, production-ready code with comments.",
+            coding_prompt,
+            rag_context,
+            history,
+            handoff=reasoning_answer,
         )
+        code_answer = chat("coding", messages, max_tokens=max_tokens)
         tracker.end("llm_code")
 
         combined = f"{reasoning_answer}\n\n---\n\n### Implementation\n\n{code_answer}"
@@ -333,13 +372,8 @@ def execute(intent: str, enhanced_prompt: str, rag_context: str, tracker: StepTi
 
     # fallback
     tracker.start("llm_fallback")
-    answer = chat(
-        "general",
-        [
-            {"role": "system", "content": system_base},
-            {"role": "user", "content": enhanced_prompt},
-        ],
-    )
+    messages, max_tokens = budgeted_messages("general", system_base, enhanced_prompt, rag_context, history)
+    answer = chat("general", messages, max_tokens=max_tokens)
     tracker.end("llm_fallback")
     return answer, ["general (llama3.1:8b)"]
 
@@ -361,6 +395,7 @@ async def completions(request: Request):
         return JSONResponse({"error": "No user message found"}, status_code=400)
 
     wants_trace = any(t in user_msg.lower() for t in TRACE_TRIGGERS)
+    history = prior_turns(messages, user_msg)
     tracker = StepTimer()
 
     # Step 1 — parallel enhance+classify AND early RAG keyword check
@@ -409,10 +444,6 @@ async def completions(request: Request):
 
         tracker.end("rag")
 
-    system_base = "You are a helpful expert assistant."
-    if rag_context:
-        system_base += f"\n\n{rag_context}"
-
     # Step 3 — check if task needs decomposition
     if intent == "code+reasoning" and not wants_trace:
         print("[Decomposer] Routing to task decomposer...")
@@ -449,22 +480,19 @@ async def completions(request: Request):
     # Step 3 — streaming path (simple intents only, no trace, no chaining)
     if wants_stream and not wants_trace and intent != "code+reasoning":
         model_alias = MODELS.get(intent, "general")
-        system_msg = system_base
+        system_msg = "You are a helpful expert assistant."
         if intent == "code":
             system_msg += "\nWrite clean, production-ready code with comments."
         elif intent == "reasoning":
             system_msg += "\nThink step by step. Be thorough."
+        stream_messages, max_tokens = budgeted_messages(
+            model_alias, system_msg, enhanced_prompt, rag_context, history
+        )
 
         msg_id = f"jarvis-{int(time.time())}"
 
         def stream_generator():
-            for token in chat_stream(
-                model_alias,
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": enhanced_prompt},
-                ],
-            ):
+            for token in chat_stream(model_alias, stream_messages, max_tokens=max_tokens):
                 chunk = {
                     "id": msg_id,
                     "object": "chat.completion.chunk",
@@ -478,7 +506,7 @@ async def completions(request: Request):
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
     # Step 3 — non-streaming execute
-    answer, models_used = execute(intent, enhanced_prompt, rag_context, tracker)
+    answer, models_used = execute(intent, enhanced_prompt, rag_context, tracker, history)
 
     # Step 4 — trace
     if wants_trace:
