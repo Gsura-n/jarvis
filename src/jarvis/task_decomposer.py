@@ -18,7 +18,10 @@ from typing import TypedDict
 import requests
 from langgraph.graph import END, StateGraph
 
+from jarvis.budget import answer_token_budget, assemble_messages, context_window
 from jarvis.config import settings
+from jarvis.policy import decide
+from jarvis.registry import current_snapshot
 from jarvis.subtask_tracer import traced_stream_call
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -38,10 +41,17 @@ class JarvisState(TypedDict):
     error: str | None
 
 
+def routed(intent: str):
+    """Deployment for one subtask. Uses the snapshot the gateway pinned for this request."""
+    return decide(intent, "", None, current_snapshot(), settings.topology)
+
+
 # ── LiteLLM helper ────────────────────────────────────────────────────────────
 def call_model(
     model: str, system: str, user: str, temperature: float = 0.3, max_tokens: int = 3000, _retry: bool = True
 ) -> str:
+    if model == "general":
+        model = routed("general").deployment or "general-small-mini"
     try:
         r = requests.post(
             f"{LITELLM_BASE}/chat/completions",
@@ -117,7 +127,7 @@ Respond ONLY with valid JSON:
 def detect_complexity(state: JarvisState) -> JarvisState:
     print(f"\n🔍 Detecting complexity for: {state['prompt'][:80]}...")
     try:
-        result = call_model("general-small-mini", COMPLEXITY_SYSTEM, state["prompt"], temperature=0.1)
+        result = call_model("general", COMPLEXITY_SYSTEM, state["prompt"], temperature=0.1)
         parsed = parse_json(result)
         complexity = parsed.get("complexity", "simple")
         reasoning = parsed.get("reasoning", "")
@@ -182,7 +192,7 @@ def split_tasks(state: JarvisState) -> JarvisState:
     print("\n📋 Splitting into subtasks...")
     try:
         result = call_model(
-            "general-small-mini",
+            "general",
             SPLITTER_SYSTEM,
             f"Original prompt: {state['prompt']}\n\nContext: {state['reasoning']}",
             temperature=0.2,
@@ -219,13 +229,7 @@ def split_tasks(state: JarvisState) -> JarvisState:
         }
 
 
-# ── Node 3 — Parallel Task Executor with Structured Handoff ───────────────────
-INTENT_TO_MODEL = {
-    "code": "code-small-mini",
-    "reasoning": "reasoning-large-mini",
-    "general": "general-small-mini",
-}
-
+# ── Node 3 — Task executor with structured handoff ────────────────────────────
 INTENT_SYSTEM = {
     "code": "You are an expert coder. Write clean, production-ready code with comments.",
     "reasoning": "You are an expert architect. Be DECISIVE. Briefly consider the key options, then COMMIT to a clear recommendation. Do NOT enumerate every possibility or keep second-guessing — pick the best approach and justify it concisely. State your final recommendation explicitly and clearly. Aim to conclude within a few paragraphs.",
@@ -239,11 +243,7 @@ it considered, rejected, and recommended. Your job is to IMPLEMENT the recommend
 approach. Do not re-think the architecture; build on the reasoning provided.
 Write clean, production-ready code with comments.
 
-=== FULL REASONING HANDOFF ===
-{reasoning}
-=== END HANDOFF ===
-
-Implement the recommended approach. Avoid the rejected approaches."""
+The handoff follows. Implement the recommended approach and avoid the rejected ones."""
 
 
 def is_broken_result(text: str) -> bool:
@@ -257,7 +257,7 @@ def is_broken_result(text: str) -> bool:
 def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict:
     """Execute one subtask. Used by both parallel and sequential paths."""
     intent = subtask.get("intent", "general")
-    model = INTENT_TO_MODEL.get(intent, "general-small-mini")
+    model = routed(intent).deployment or "general-small-mini"
     implements = subtask.get("implements")
     if isinstance(implements, list):
         implements = implements[0] if implements else None
@@ -283,35 +283,32 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
     )
 
     if handoff_ok:
-        reasoning_full = completed[implements]["result"]
-        system = HANDOFF_SYSTEM.format(reasoning=reasoning_full)
-        if rag_context:
-            system += f"\n\nCodebase context:\n{rag_context}"
+        system = HANDOFF_SYSTEM
+        handoff = completed[implements]["result"]
         user_prompt = f"Implement: {subtask['task']}"
         tag = f"(handoff from #{implements})"
     else:
         system = INTENT_SYSTEM.get(intent, INTENT_SYSTEM["general"])
-        if rag_context:
-            system += f"\n\nCodebase context:\n{rag_context}"
-        user_prompt = f"{subtask['task']}{dep_context}"
-        if implements and not handoff_ok:
-            tag = "(standalone — handoff source was broken)"
-        else:
-            tag = ""
+        handoff = dep_context
+        user_prompt = subtask["task"]
+        tag = "(standalone — handoff source was broken)" if implements else ""
 
     print(f"   → [{subtask['id']}] {subtask['task'][:50]}... ({model}) {tag}")
-    # Reasoning models spend tokens thinking before answering, so give them
-    # a larger budget AND more wall-clock time. Code/general are faster.
-    if model == "reasoning":
-        token_budget = 6000
-        wall_limit = 420  # 7 min — DeepSeek is thorough but slow
-    else:
-        token_budget = 4000
-        wall_limit = 300  # 5 min
+    token_budget = answer_token_budget(model, settings.topology)
+    wall_limit = 420 if "-large" in model else 300
+    messages = assemble_messages(
+        system=system,
+        history=[],
+        rag=rag_context,
+        handoff=handoff,
+        user=user_prompt,
+        max_tokens=token_budget,
+        num_ctx=context_window(settings.topology, model),
+    )
     result_text = traced_stream_call(
         model,
-        system,
-        user_prompt,
+        messages[0]["content"],
+        messages[-1]["content"],
         subtask_id=subtask["id"],
         task_desc=subtask["task"][:80],
         max_tokens=token_budget,
@@ -420,7 +417,7 @@ def smart_compress(result: dict) -> str:
         for i, block in enumerate(code_blocks):
             prose = prose.replace(block, f"__CODE_BLOCK_{i}__")
         if len(prose) > 600:
-            prose = call_model("general-small-mini", PROSE_COMPRESS_SYSTEM, prose, temperature=0.1)
+            prose = call_model("general", PROSE_COMPRESS_SYSTEM, prose, temperature=0.1)
         # restore code blocks
         for i, block in enumerate(code_blocks):
             prose = prose.replace(f"__CODE_BLOCK_{i}__", f"\n{block}\n")
@@ -430,12 +427,12 @@ def smart_compress(result: dict) -> str:
     if result["intent"] == "reasoning":
         if len(text) < 800:
             return text
-        return call_model("general-small-mini", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+        return call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
 
     # General — compress more aggressively
     if len(text) < 400:
         return text
-    return call_model("general-small-mini", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+    return call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
 
 
 def aggregate_results(state: JarvisState) -> JarvisState:
@@ -488,7 +485,7 @@ def aggregate_results(state: JarvisState) -> JarvisState:
             f"Running synthesis so far:\n{synthesis}\n\n"
             f"New subtask result to integrate:\n## {c['task']}\n{c['content']}"
         )
-        synthesis = call_model("general-small-mini", SYNTHESIS_SYSTEM, synthesis_input, temperature=0.2)
+        synthesis = call_model("general", SYNTHESIS_SYSTEM, synthesis_input, temperature=0.2)
 
     print(f"   ✅ Final answer ({len(synthesis)} chars)")
     return {**state, "final_answer": synthesis}
@@ -538,9 +535,11 @@ def decompose_and_execute(prompt: str, rag_context: str = "") -> dict:
         "error": None,
     }
     final_state = graph.invoke(initial_state)
-    models_used = list(
-        set(INTENT_TO_MODEL.get(r["intent"], "general-small-mini") for r in final_state.get("results", []))
-    )
+    models_used = []
+    for row in final_state.get("results", []):
+        name = routed(row.get("intent", "general")).deployment
+        if name and name not in models_used:
+            models_used.append(name)
     return {
         "answer": final_state.get("final_answer", ""),
         "complexity": final_state.get("complexity", "simple"),

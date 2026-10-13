@@ -75,3 +75,82 @@ def test_nothing_available_still_names_the_mini_fallback():
     assert decision.device == "mini"
     assert decision.deployment == "general-small-mini"
     assert decision.reason
+
+
+def _client(monkeypatch, offline=False):
+    """Lifespan polls through this stub, so the test never touches the LAN."""
+
+    async def fetch(url: str, timeout: float) -> dict:
+        if "10.0.0.47" in url and offline:
+            raise TimeoutError("asleep")
+        if "10.0.0.47" in url:
+            return {"models": [{"name": MBP_MODEL}]}
+        return {"models": [{"name": name} for name in MINI_MODELS]}
+
+    monkeypatch.setattr("jarvis.registry.fetch_json", fetch)
+    from fastapi.testclient import TestClient
+
+    from jarvis.gateway import app
+
+    return TestClient(app)
+
+
+def _post(client, content, model="jarvis"):
+    return client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": content}]},
+    )
+
+
+def _refuse(*_args, **_kwargs):
+    raise AssertionError("this call should not happen")
+
+
+def test_explicit_coding_skips_the_classifier(monkeypatch):
+    monkeypatch.setattr("jarvis.gateway.enhance_and_classify", _refuse)
+    monkeypatch.setattr("jarvis.gateway.chat", lambda model, *_a, **_k: f"from {model}")
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    with _client(monkeypatch) as client:
+        response = _post(client, "print hello", model="coding")
+    assert response.status_code == 200
+    assert "from code-small-mini" in response.json()["choices"][0]["message"]["content"]
+
+
+def test_reasoning_trace_names_the_laptop_when_it_is_online(monkeypatch):
+    monkeypatch.setattr("jarvis.gateway.chat", lambda *_a, **_k: "done")
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    with _client(monkeypatch) as client:
+        response = _post(client, "which model answered that?", model="reasoning")
+    text = response.json()["choices"][0]["message"]["content"]
+    assert "Device: `macbook-pro`" in text
+    assert "Deployment: `reasoning-large-mbp`" in text
+    assert "Degraded: `false`" in text
+
+
+def test_offline_laptop_answers_from_the_mini(monkeypatch):
+    monkeypatch.setattr("jarvis.gateway.chat", lambda model, *_a, **_k: f"from {model}")
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    with _client(monkeypatch, offline=True) as client:
+        response = _post(client, "which model answered that?", model="reasoning")
+    text = response.json()["choices"][0]["message"]["content"]
+    assert "from reasoning-large-mini" in text
+    assert "Device: `mini`" in text
+    assert "Degraded: `true`" in text
+
+
+def test_degraded_design_and_build_uses_the_decomposer(monkeypatch):
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    monkeypatch.setattr(
+        "jarvis.gateway.enhance_and_classify",
+        lambda *_a, **_k: {"enhanced_prompt": "build it", "intent": "code+reasoning", "needs_rag": False},
+    )
+    monkeypatch.setattr(
+        "jarvis.gateway.decompose_and_execute",
+        lambda *_a, **_k: {"answer": "partial", "models_used": ["code-small-mini"], "subtasks": [{"id": 1}]},
+    )
+    monkeypatch.setattr("jarvis.gateway.chat", _refuse)
+    with _client(monkeypatch, offline=True) as client:
+        response = _post(client, "design and build a todo api")
+    text = response.json()["choices"][0]["message"]["content"]
+    assert "partial" in text
+    assert "Decomposed into 1 subtasks" in text
