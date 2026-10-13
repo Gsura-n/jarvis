@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
 
-from jarvis.budget import answer_token_budget, assemble_messages, context_window
+from jarvis.budget import REFERENCE_RULE, answer_token_budget, assemble_messages, context_window, token_caps
 from jarvis.config import jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
 from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
@@ -376,6 +376,7 @@ def budgeted_messages(
         user=user,
         max_tokens=max_tokens,
         num_ctx=context_window(settings.topology, alias),
+        caps=token_caps(settings.topology),
     )
     return messages, max_tokens
 
@@ -389,7 +390,7 @@ def execute(
     history: list | None,
     decision: Decision,
 ) -> tuple[str, list[str]]:
-    system_base = "You are a helpful expert assistant."
+    system_base = f"You are a helpful expert assistant. {REFERENCE_RULE}"
     history = history or []
     alias = decision.deployment
     label = f"{alias} ({decision.device})"
@@ -562,7 +563,7 @@ async def completions(request: Request):
 
     # Step 3 — streaming path. Heavy calls hold that device's semaphore until the stream ends.
     if wants_stream and not wants_trace and decision.deployment != "decomposer":
-        system_msg = "You are a helpful expert assistant."
+        system_msg = f"You are a helpful expert assistant. {REFERENCE_RULE}"
         if intent == "code":
             system_msg += "\nWrite clean, production-ready code with comments."
         elif intent in ("reasoning", "code+reasoning"):
