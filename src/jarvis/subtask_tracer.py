@@ -254,7 +254,7 @@ if __name__ == "__main__":
     # Quick test
     print("Testing traced stream call...")
     result = traced_stream_call(
-        "reasoning",
+        "reasoning-large-mini",
         "You are an architect. Think step by step.",
         "Design a simple URL shortener. Be concise.",
         subtask_id=99,

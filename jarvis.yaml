@@ -81,7 +81,7 @@ budgets:
     rag: 1500
     handoff: 2500
     answer: {large: 6000, small: 4000}
-  num_ctx: {large: 16384, small: 8192, classify: 4096}
+  # tiers[*].num_ctx is the only context window. context_window() reads that.
 
 guards:
   min_answer_chars: 40

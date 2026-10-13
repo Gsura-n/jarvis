@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from jarvis.registry import normalize_model
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -56,7 +58,8 @@ def _ok(snapshot, device: str, model: str) -> tuple[bool, str]:
     pulled = view["pulled"] if isinstance(view, Mapping) else view.pulled
     if not online:
         return False, f"{device} offline"
-    if model not in tuple(pulled or ()):
+    wanted = normalize_model(model)
+    if wanted not in tuple(pulled or ()):
         return False, f"{model} not pulled on {device}"
     return True, ""
 

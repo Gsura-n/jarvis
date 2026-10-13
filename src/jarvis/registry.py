@@ -53,6 +53,13 @@ _bound: contextvars.ContextVar[Snapshot | None] = contextvars.ContextVar(
 )
 
 
+def normalize_model(name: str) -> str:
+    """Ollama reports an untagged model as name:latest. Tagged names stay as they are."""
+    if ":" not in name:
+        return f"{name}:latest"
+    return name
+
+
 def _model_names(payload: dict) -> tuple[str, ...]:
     found: list[str] = []
     for item in payload.get("models") or []:
@@ -60,8 +67,11 @@ def _model_names(payload: dict) -> tuple[str, ...]:
             continue
         for key in ("name", "model"):
             value = item.get(key)
-            if isinstance(value, str) and value not in found:
-                found.append(value)
+            if not isinstance(value, str):
+                continue
+            normalized = normalize_model(value)
+            if normalized not in found:
+                found.append(normalized)
     return tuple(found)
 
 
@@ -69,7 +79,7 @@ def _loaded_models(payload: dict) -> tuple[tuple[str, int | None, int | None], .
     rows = []
     for item in payload.get("models") or []:
         if isinstance(item, dict) and isinstance(item.get("name"), str):
-            rows.append((item["name"], item.get("size"), item.get("size_vram")))
+            rows.append((normalize_model(item["name"]), item.get("size"), item.get("size_vram")))
     return tuple(rows)
 
 
