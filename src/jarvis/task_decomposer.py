@@ -18,7 +18,7 @@ from typing import TypedDict
 import requests
 from langgraph.graph import END, StateGraph
 
-from jarvis.budget import answer_token_budget, assemble_messages, context_window
+from jarvis.budget import REFERENCE_RULE, answer_token_budget, assemble_messages, context_window, token_caps
 from jarvis.config import settings
 from jarvis.policy import decide
 from jarvis.registry import current_snapshot
@@ -294,6 +294,7 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
         tag = "(standalone — handoff source was broken)" if implements else ""
 
     print(f"   → [{subtask['id']}] {subtask['task'][:50]}... ({model}) {tag}")
+    system = f"{system}\n{REFERENCE_RULE}"
     token_budget = answer_token_budget(model, settings.topology)
     walls = settings.topology.get("budgets", {}).get("subtask_wall_s", {})
     # A degraded -large fallback is still slow, so it keeps the longer clock.
@@ -307,6 +308,7 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
         user=user_prompt,
         max_tokens=token_budget,
         num_ctx=context_window(settings.topology, model),
+        caps=token_caps(settings.topology),
     )
     result_text = traced_stream_call(
         model,
