@@ -5,12 +5,13 @@ import os
 os.environ.setdefault("JARVIS_ENV_FILE", "/nonexistent/.jarvis.env")
 
 from jarvis.config import settings  # noqa: E402
-from jarvis.policy import decide, prefer_decomposer  # noqa: E402
+from jarvis.policy import decide, prefer_decomposer, walk_tier  # noqa: E402
 
 MBP_MODEL = "qwen3:30b-a3b-instruct-2507-q4_K_M"
 MINI_MODELS = (
     "llama3.2:3b",
     "nomic-embed-text",
+    "nomic-embed-text:latest",
     "llama3.1:8b",
     "qwen2.5-coder:7b",
     "deepseek-r1:8b",
@@ -67,6 +68,21 @@ def test_explicit_model_beats_intent():
     assert prefer_decomposer("code", "coding", decision, force=False) is False
     forced = decide("general", "", None, BOTH, settings.topology)
     assert prefer_decomposer("general", None, forced, force=True) is True
+
+
+def test_latest_tag_counts_as_the_untagged_embed_model():
+    snapshot = snap({"mini"}, {"mini": ("nomic-embed-text:latest",)})
+    decision = walk_tier("embed", snapshot, settings.topology, "embed")
+    assert decision.deployment == "embed-mini"
+    assert decision.device == "mini"
+    assert decision.degraded is False
+
+
+def test_normalize_model_keeps_an_existing_tag_and_marks_a_bare_name():
+    from jarvis.registry import normalize_model
+
+    assert normalize_model("qwen2.5-coder:7b") == "qwen2.5-coder:7b"
+    assert normalize_model("nomic-embed-text") == "nomic-embed-text:latest"
 
 
 def test_nothing_available_still_names_the_mini_fallback():
@@ -154,3 +170,60 @@ def test_degraded_design_and_build_uses_the_decomposer(monkeypatch):
     text = response.json()["choices"][0]["message"]["content"]
     assert "partial" in text
     assert "Decomposed into 1 subtasks" in text
+
+
+def test_model_list_includes_trace_and_decompose(monkeypatch):
+    with _client(monkeypatch) as client:
+        names = {item["id"] for item in client.get("/v1/models").json()["data"]}
+    assert "jarvis-trace" in names
+    assert "jarvis-decompose" in names
+
+
+def test_parallel_subtasks_keep_the_mini_only_snapshot(monkeypatch):
+    """Fails before the fix: ThreadPoolExecutor does not copy the pinned snapshot."""
+    from types import MappingProxyType
+
+    from jarvis.registry import (
+        DeviceView,
+        Registry,
+        Snapshot,
+        bind_snapshot,
+        mini_only,
+        reset_snapshot,
+        set_registry,
+    )
+    from jarvis.task_decomposer import execute_tasks_parallel, routed
+
+    mbp = "qwen3:30b-a3b-instruct-2507-q4_K_M"
+    live = Snapshot(
+        MappingProxyType(
+            {
+                "mini": DeviceView("mini", True, ("deepseek-r1:8b", "llama3.1:8b"), (), 0),
+                "macbook-pro": DeviceView("macbook-pro", True, (mbp,), (), 0),
+            }
+        )
+    )
+    registry = Registry(settings.topology)
+    registry.snapshot = live
+    set_registry(registry)
+    token = bind_snapshot(mini_only(live))
+    seen = []
+
+    def record(subtask, _completed, _rag):
+        seen.append(routed("reasoning").deployment)
+        return {"id": subtask["id"], "task": subtask["task"], "intent": "reasoning", "result": "ok"}
+
+    monkeypatch.setattr("jarvis.task_decomposer.run_single_subtask", record)
+    state = {
+        "subtasks": [
+            {"id": 1, "task": "think a", "intent": "reasoning", "depends_on": []},
+            {"id": 2, "task": "think b", "intent": "reasoning", "depends_on": []},
+        ],
+        "rag_context": "",
+    }
+    try:
+        execute_tasks_parallel(state)
+    finally:
+        reset_snapshot(token)
+        set_registry(None)
+    assert seen == ["reasoning-large-mini", "reasoning-large-mini"]

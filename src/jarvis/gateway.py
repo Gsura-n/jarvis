@@ -656,6 +656,8 @@ def list_models():
             {"id": "coding", "object": "model", "owned_by": "jarvis"},
             {"id": "reasoning", "object": "model", "owned_by": "jarvis"},
             {"id": "general", "object": "model", "owned_by": "jarvis"},
+            {"id": "jarvis-trace", "object": "model", "owned_by": "jarvis"},
+            {"id": "jarvis-decompose", "object": "model", "owned_by": "jarvis"},
         ],
     }
 

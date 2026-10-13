@@ -10,6 +10,7 @@ Features:
   - Shared context bus across agents
 """
 
+import contextvars
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -389,7 +390,12 @@ def execute_tasks_parallel(state: JarvisState) -> JarvisState:
             remaining.remove(ready[0])
         else:
             with ThreadPoolExecutor(max_workers=min(len(ready), 3)) as ex:
-                futures = {ex.submit(run_single_subtask, t, completed, rag_context): t for t in ready}
+                futures = {
+                    ex.submit(
+                        contextvars.copy_context().run, run_single_subtask, t, completed, rag_context
+                    ): t
+                    for t in ready
+                }
                 for fut in as_completed(futures):
                     res = fut.result()
                     completed[res["id"]] = res
