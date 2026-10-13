@@ -13,11 +13,11 @@ import asyncio
 import hmac
 import json
 import logging
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 
+import httpx
 import requests
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
@@ -251,73 +251,54 @@ def chat(
         raise
 
 
-def chat_stream(model_alias: str, messages: list, temperature: float = 0.3, max_tokens: int | None = None):
-    """Streaming chat. Closing this generator closes the HTTP connection, which stops Ollama."""
-    payload = {"model": model_alias, "messages": messages, "temperature": temperature, "stream": True}
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    skipped = 0
-    with requests.post(
-        f"{LITELLM_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-        json=payload,
-        timeout=600,
-        stream=True,
-    ) as response:
-        response.raise_for_status()
-        for line in response.iter_lines():
-            if not line:
-                continue
-            decoded = line.decode("utf-8")
-            if not decoded.startswith("data: ") or decoded == "data: [DONE]":
-                continue
-            try:
-                chunk = json.loads(decoded[6:])
-                delta = chunk["choices"][0]["delta"].get("content", "")
-            except Exception:
-                skipped += 1
-                continue
-            if delta:
-                yield delta
-    if skipped:
-        log.warning("skipped %s unreadable stream lines deployment=%s", skipped, model_alias)
+def _stream_client() -> httpx.AsyncClient:
+    """Async LiteLLM client. Tests swap this to inject a transport."""
+    return httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=600.0, write=600.0, pool=5.0))
 
 
 async def stream_tokens(deployment: str, device: str, messages: list, max_tokens: int):
-    """Yield tokens for one heavy call. Stop closes the model stream and then releases the semaphore."""
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    stop = threading.Event()
+    """Yield tokens for one heavy call.
 
-    def produce():
-        stream = chat_stream(deployment, messages, max_tokens=max_tokens)
-        try:
-            while not stop.is_set():
-                try:
-                    token = next(stream)
-                except StopIteration:
-                    break
-                if stop.is_set():
-                    break
-                asyncio.run_coroutine_threadsafe(queue.put(token), loop).result()
-        finally:
-            stream.close()
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
-
-    async with device_semaphore(device):
-        worker = asyncio.create_task(asyncio.to_thread(produce))
-        try:
-            while True:
-                token = await queue.get()
-                if token is None:
-                    break
-                yield token
-        finally:
-            stop.set()
-            try:
-                await worker
-            except Exception:
-                log.exception("stream worker failed deployment=%s", deployment)
+    The read runs on the event loop. Cancelling it closes the HTTP connection
+    before the device semaphore is released. CancelledError is not caught.
+    """
+    payload = {
+        "model": deployment,
+        "messages": messages,
+        "temperature": 0.3,
+        "stream": True,
+        "max_tokens": max_tokens,
+    }
+    skipped = 0
+    try:
+        async with device_semaphore(device):
+            async with _stream_client() as client:
+                async with client.stream(
+                    "POST",
+                    f"{LITELLM_BASE}/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {LITELLM_KEY}"},
+                ) as response:
+                    response.raise_for_status()
+                    try:
+                        async for line in response.aiter_lines():
+                            if not line or not line.startswith("data: ") or line == "data: [DONE]":
+                                continue
+                            try:
+                                chunk = json.loads(line[6:])
+                                delta = chunk["choices"][0]["delta"].get("content", "")
+                            except Exception:
+                                skipped += 1
+                                continue
+                            if delta:
+                                yield delta
+                    finally:
+                        if skipped:
+                            log.warning(
+                                "skipped %s unreadable stream lines deployment=%s", skipped, deployment
+                            )
+    except Exception:
+        log.exception("stream worker failed deployment=%s", deployment)
 
 
 # ── Step 1 — Enhance + Classify ───────────────────────────────────────────────
