@@ -39,6 +39,7 @@ devices:
 
 registry:
   poll_interval_s: 20
+  poll_timeout_s: 3             # a sleeping laptop must not stall the other devices
   offline_after_failures: 2
   online_after_successes: 1
 

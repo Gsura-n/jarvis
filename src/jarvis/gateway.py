@@ -9,20 +9,24 @@ OpenAI-compatible API that orchestrates:
   6. Model trace on demand with timing + memory
 """
 
+import asyncio
+import hmac
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, suppress
 
 import requests
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
 
 from jarvis.budget import answer_token_budget, assemble_messages, context_window
-from jarvis.config import settings
+from jarvis.config import jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
+from jarvis.registry import Registry, current_snapshot, set_registry
 from jarvis.task_decomposer import decompose_and_execute
 
 # ── Config — everything comes from jarvis.config (env file + jarvis.yaml) ─────
@@ -76,7 +80,23 @@ RAG_TRIGGERS = [
     "component",
 ]
 
-app = FastAPI(title="Jarvis Smart Gateway")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    registry = Registry(settings.topology)
+    set_registry(registry)
+    await registry.poll_once()
+    task = asyncio.create_task(registry.run())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        set_registry(None)
+
+
+app = FastAPI(title="Jarvis Smart Gateway", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
@@ -537,7 +557,21 @@ async def completions(request: Request):
     )
 
 
+def require_api_key(request: Request) -> None:
+    """Shared key check. There are no roles yet: missing or wrong key is 401."""
+    expected = jarvis_api_key()
+    header = request.headers.get("authorization", "")
+    token = header[7:] if header.startswith("Bearer ") else ""
+    if not expected or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="missing or invalid api key")
+
+
 # ── Other endpoints ───────────────────────────────────────────────────────────
+@app.get("/devices", dependencies=[Depends(require_api_key)])
+def list_devices():
+    return current_snapshot().as_dict()
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "gateway": "jarvis", "port": 4001}

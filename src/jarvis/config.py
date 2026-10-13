@@ -34,6 +34,11 @@ def _load_yaml() -> tuple[dict, Path]:
     return data, cfg
 
 
+def jarvis_api_key() -> str:
+    """Bearer token clients send. Read on each check so tests can set JARVIS_API_KEY."""
+    return os.getenv("JARVIS_API_KEY", "")
+
+
 def _expand(p: str | Path) -> Path:
     p = Path(p).expanduser()
     return p if p.is_absolute() else (REPO_ROOT / p)
