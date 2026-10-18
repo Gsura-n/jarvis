@@ -667,6 +667,7 @@ def list_models():
     return {
         "object": "list",
         "data": [
+            {"id": "jarvis", "object": "model", "owned_by": "jarvis"},
             {"id": "coding", "object": "model", "owned_by": "jarvis"},
             {"id": "reasoning", "object": "model", "owned_by": "jarvis"},
             {"id": "general", "object": "model", "owned_by": "jarvis"},
