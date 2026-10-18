@@ -218,6 +218,9 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
 
     The read runs on the event loop. Cancelling it closes the HTTP connection
     before the device semaphore is released. CancelledError is not caught.
+
+    Thinking (reasoning_content) is yielded inside a <think> block that closes before
+    the first answer token, or at the end of the stream.
     """
     payload = {
         "model": deployment,
@@ -227,6 +230,7 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
         "max_tokens": max_tokens,
     }
     skipped = 0
+    thinking = False
     try:
         async with device_semaphore(device):
             async with _stream_client() as client:
@@ -243,12 +247,22 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
                                 continue
                             try:
                                 chunk = json.loads(line[6:])
-                                delta = chunk["choices"][0]["delta"].get("content", "")
+                                delta = chunk["choices"][0]["delta"]
+                                thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                                text = delta.get("content") or ""
                             except Exception:
                                 skipped += 1
                                 continue
-                            if delta:
-                                yield delta
+                            if thought:
+                                if not thinking:
+                                    thinking = True
+                                    yield "<think>\n"
+                                yield thought
+                            if text:
+                                if thinking:
+                                    thinking = False
+                                    yield "\n</think>\n\n"
+                                yield text
                     finally:
                         if skipped:
                             log.warning(
@@ -256,6 +270,8 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
                             )
     except Exception:
         log.exception("stream worker failed deployment=%s", deployment)
+    if thinking:
+        yield "\n</think>\n\n"
 
 
 # ── Step 1 — History ──────────────────────────────────────────────────────────
@@ -273,7 +289,11 @@ def prior_turns(messages: list, user_msg: str) -> list[dict]:
         if role not in ("user", "assistant"):
             continue
         text = text_of(message.get("content"))
-        turns.append({"role": role, "content": clean_assistant(text) if role == "assistant" else text})
+        if role == "assistant":
+            text = clean_assistant(text)
+            if not text:
+                continue
+        turns.append({"role": role, "content": text})
     return turns
 
 
