@@ -23,7 +23,8 @@ _EXPLICIT = {
     "coding": "code-small",
     "reasoning": "reasoning-large",
 }
-_LARGE = {"large", "complex"}
+# Only "complex" goes to a large tier. "medium" stays small on purpose; unknown values do too.
+_LARGE = {"complex"}
 
 
 def pick_tier(intent: str, complexity: str, explicit_model: str | None) -> tuple[str, str]:
@@ -31,13 +32,14 @@ def pick_tier(intent: str, complexity: str, explicit_model: str | None) -> tuple
     if explicit_model in _EXPLICIT:
         return _EXPLICIT[explicit_model], f"explicit model {explicit_model}"
     kind = (intent or "general").strip().lower()
-    large = (complexity or "").strip().lower() in _LARGE
+    level = (complexity or "").strip().lower()
+    large = level in _LARGE
     if kind == "code+reasoning":
         # One 30B call covers design and build when that tier is really available.
         return "reasoning-large", "intent code+reasoning"
     if kind == "code":
         tier = "code-large" if large else "code-small"
-        return tier, f"intent code complexity {complexity or 'small'}"
+        return tier, f"intent code complexity {level or 'simple'}"
     if kind == "reasoning":
         return "reasoning-large", "intent reasoning"
     return "general-small", f"intent {kind or 'general'}"
