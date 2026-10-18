@@ -1,5 +1,7 @@
 """The trace marker, system-text join, TraceStore and trace follow-up detection (pure, no gateway)."""
 
+import threading
+
 import pytest
 
 from jarvis.messages import TRACE_MARK, clean_assistant, system_text
@@ -95,6 +97,8 @@ def test_trace_store_ignores_empty_answers():
         "what model answered",
         "which model did you use?",
         "what model did you use",
+        "can you show the trace?",
+        "Show trace.",
     ],
 )
 def test_asks_for_trace(text):
@@ -109,10 +113,41 @@ def test_asks_for_trace(text):
         "what model is best for code?",
         "explain how tracing works in OpenTelemetry",
         "",
+        "which model answered? also, how do I add a composite index?",
+        "what's the model trace format in Jarvis's README?",
+        "Can you explain what the model trace shows for a streamed answer in detail?",
     ],
 )
 def test_ordinary_questions_do_not_ask_for_a_trace(text):
     assert not asks_for_trace(text)
+
+
+def test_trace_store_is_safe_to_use_from_many_threads():
+    store = TraceStore(size=64)
+
+    def work(n):
+        for i in range(200):
+            store.put(f"answer {n} {i}", f"trace {n} {i}")
+            store.get(f"answer {n} {i - 1}")
+
+    threads = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(store) == 64
+
+
+def test_trace_store_guards_put_and_get_with_a_lock():
+    store = TraceStore()
+    assert hasattr(store._lock, "acquire") and hasattr(store._lock, "release")
+    with store._lock:
+        reader = threading.Thread(target=store.get, args=("x",))
+        reader.start()
+        reader.join(0.2)
+        assert reader.is_alive()  # blocked until the lock is free
+    reader.join(2)
+    assert not reader.is_alive()
 
 
 def _convo(ask):

@@ -15,6 +15,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 
 import httpx
 import requests
@@ -35,7 +36,7 @@ from jarvis.budget import (
 from jarvis.classify import classify
 from jarvis.config import cors_origins, jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
-from jarvis.messages import clean_assistant, text_of
+from jarvis.messages import clean_assistant, system_text, text_of
 from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
 from jarvis.registry import Registry, bind_snapshot, current_snapshot, mini_only, reset_snapshot, set_registry
 from jarvis.task_decomposer import decompose_and_execute
@@ -351,8 +352,17 @@ def prior_turns(messages: list, user_msg: str) -> list[dict]:
 
 
 def budgeted_messages(
-    alias: str, system: str, user: str, rag: str = "", history: list | None = None, handoff: str = ""
+    alias: str,
+    system: str,
+    user: str,
+    rag: str = "",
+    history: list | None = None,
+    handoff: str = "",
+    client_system: str = "",
 ):
+    """Our system prompt stays first and is never changed by the client's, which follows a blank line."""
+    if client_system:
+        system = f"{system}\n\n{client_system}"
     max_tokens = answer_token_budget(alias, settings.topology)
     messages = assemble_messages(
         system=system,
@@ -376,22 +386,24 @@ def execute(
     tracker: StepTimer,
     history: list | None,
     decision: Decision,
+    client_system: str = "",
 ) -> tuple[str, list[str]]:
     system_base = f"You are a helpful expert assistant. {REFERENCE_RULE}"
     history = history or []
     alias = decision.deployment
     label = f"{alias} ({decision.device})"
+    build = partial(budgeted_messages, client_system=client_system)
 
     if intent == "general":
         tracker.start("llm_general")
-        messages, max_tokens = budgeted_messages(alias, system_base, user_msg, rag_context, history)
+        messages, max_tokens = build(alias, system_base, user_msg, rag_context, history)
         answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_general")
         return answer, [label]
 
     if intent == "code":
         tracker.start("llm_code")
-        messages, max_tokens = budgeted_messages(
+        messages, max_tokens = build(
             alias,
             system_base + "\nWrite clean, production-ready code with comments.",
             user_msg,
@@ -408,13 +420,13 @@ def execute(
         if intent == "code+reasoning":
             extra += "\nDesign the solution, then implement it in the same answer."
         tracker.start("llm_reasoning")
-        messages, max_tokens = budgeted_messages(alias, system_base + extra, user_msg, rag_context, history)
+        messages, max_tokens = build(alias, system_base + extra, user_msg, rag_context, history)
         answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_reasoning")
         return answer, [label]
 
     tracker.start("llm_fallback")
-    messages, max_tokens = budgeted_messages(alias, system_base, user_msg, rag_context, history)
+    messages, max_tokens = build(alias, system_base, user_msg, rag_context, history)
     answer = chat(alias, messages, max_tokens=max_tokens)
     tracker.end("llm_fallback")
     return answer, [label]
@@ -457,6 +469,7 @@ async def completions(request: Request):
     explicit = explicit_model(requested if isinstance(requested, str) else None)
     wants_trace = requested == "jarvis-trace" or any(t in user_msg.lower() for t in TRACE_TRIGGERS)
     history = prior_turns(messages, user_msg)
+    client_system = system_text(messages)
     tracker = StepTimer()
     snapshot = current_snapshot()
 
@@ -557,7 +570,7 @@ async def completions(request: Request):
         elif intent in ("reasoning", "code+reasoning"):
             system_msg += "\nThink step by step. Be thorough."
         stream_messages, max_tokens = budgeted_messages(
-            decision.deployment, system_msg, user_msg, rag_context, history
+            decision.deployment, system_msg, user_msg, rag_context, history, client_system=client_system
         )
         msg_id = f"jarvis-{int(time.time())}"
 
@@ -581,7 +594,7 @@ async def completions(request: Request):
         try:
             async with device_semaphore(decision.device):
                 answer, models_used = await asyncio.to_thread(
-                    execute, intent, user_msg, rag_context, tracker, history, decision
+                    execute, intent, user_msg, rag_context, tracker, history, decision, client_system
                 )
         except Exception as e:
             reason = describe_error(e)

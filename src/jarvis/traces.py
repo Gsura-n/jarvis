@@ -1,6 +1,8 @@
 """Model traces: remember the last few, and spot a follow-up that asks for the previous one."""
 
 import hashlib
+import re
+import threading
 from collections import OrderedDict
 
 from jarvis.messages import clean_assistant, text_of
@@ -24,6 +26,7 @@ class TraceStore:
     def __init__(self, size: int = 256):
         self.size = size
         self._data: OrderedDict[str, str] = OrderedDict()
+        self._lock = threading.Lock()  # answers are stored from worker threads while requests read
 
     def __len__(self) -> int:
         return len(self._data)
@@ -38,19 +41,30 @@ class TraceStore:
         key = self.key(answer)
         if key is None:
             return
-        self._data[key] = trace
-        self._data.move_to_end(key)
-        while len(self._data) > self.size:
-            self._data.popitem(last=False)
+        with self._lock:
+            self._data[key] = trace
+            self._data.move_to_end(key)
+            while len(self._data) > self.size:
+                self._data.popitem(last=False)
 
     def get(self, answer: str) -> str | None:
         key = self.key(answer)
-        return self._data.get(key) if key else None
+        if not key:
+            return None
+        with self._lock:
+            return self._data.get(key)
+
+
+MAX_FOLLOWUP_WORDS = 8
+_NOT_WORD = re.compile(r"[^\w']+")
 
 
 def asks_for_trace(text: str) -> bool:
-    ask = " ".join(text.lower().split())
-    return any(phrase in ask for phrase in TRACE_FOLLOWUPS)
+    """A short message that starts or ends with a trace phrase. Longer ones are real questions."""
+    ask = " ".join(_NOT_WORD.sub(" ", text.lower()).split())
+    if not ask or len(ask.split()) > MAX_FOLLOWUP_WORDS:
+        return False
+    return any(ask.startswith(phrase) or ask.endswith(phrase) for phrase in TRACE_FOLLOWUPS)
 
 
 def trace_followup(messages: list[dict], store: TraceStore) -> str | None:
