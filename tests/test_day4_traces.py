@@ -115,6 +115,9 @@ def test_asks_for_trace(text):
         "",
         "which model answered? also, how do I add a composite index?",
         "what's the model trace format in Jarvis's README?",
+        "show traceback for this error",
+        "show tracer settings",
+        "show the traces from last run",
         "Can you explain what the model trace shows for a streamed answer in detail?",
     ],
 )

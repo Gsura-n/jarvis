@@ -36,10 +36,11 @@ from jarvis.budget import (
 from jarvis.classify import classify
 from jarvis.config import cors_origins, jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
-from jarvis.messages import clean_assistant, system_text, text_of
+from jarvis.messages import TRACE_MARK, clean_assistant, system_text, text_of
 from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
 from jarvis.registry import Registry, bind_snapshot, current_snapshot, mini_only, reset_snapshot, set_registry
 from jarvis.task_decomposer import decompose_and_execute
+from jarvis.traces import TraceStore, trace_followup
 
 log = logging.getLogger("jarvis.gateway")
 
@@ -61,16 +62,8 @@ if _missing:
 _EXPLICIT_INTENT = {"general": "general", "coding": "code", "reasoning": "reasoning"}
 _semaphores: dict[str, asyncio.Semaphore] = {}
 
-TRACE_TRIGGERS = [
-    "which model",
-    "what model",
-    "why did you",
-    "how did you",
-    "explain your process",
-    "show trace",
-    "model trace",
-    "who answered",
-]
+# Traces of the last answers, so "which model answered?" can be served without a model call.
+TRACES = TraceStore()
 
 RAG_TRIGGERS = [
     "my project",
@@ -449,6 +442,67 @@ def require_api_key(request: Request) -> None:
 api = APIRouter(dependencies=[Depends(require_api_key)])
 
 
+# ── Responses and traces ──────────────────────────────────────────────────────
+def format_trace(
+    intent: str,
+    decision: Decision,
+    rag_used: bool,
+    models_used: list[str],
+    label_source: str,
+    tracker: StepTimer,
+) -> str:
+    """The appendix. It starts with TRACE_MARK, which clean_assistant cuts from replayed history."""
+    return (
+        f"{TRACE_MARK}\n"
+        f"- Intent: `{intent}`\n"
+        f"- Tier: `{decision.tier}`\n"
+        f"- Device: `{decision.device}`\n"
+        f"- Deployment: `{decision.deployment}`\n"
+        f"- Degraded: `{str(decision.degraded).lower()}`\n"
+        f"- Reason: {decision.reason}\n"
+        f"- RAG used: `{'yes' if rag_used else 'no'}`\n"
+        f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n"
+        f"- Labels from: `{label_source}`\n\n" + tracker.summary()
+    )
+
+
+def completion_json(tracker: StepTimer, answer: str) -> JSONResponse:
+    return JSONResponse(
+        {
+            "id": f"jarvis-{int(tracker.wall_start)}",
+            "object": "chat.completion",
+            "created": int(tracker.wall_start),
+            "model": "jarvis",
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+    )
+
+
+def sse_line(msg_id: str, content: str) -> str:
+    chunk = {
+        "id": msg_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "jarvis",
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def stored_trace_response(trace: str, stream: bool, tracker: StepTimer):
+    """A trace follow-up: the stored text, as a stream or as JSON like the client asked."""
+    text = trace.strip()
+    if not stream:
+        return completion_json(tracker, text)
+    msg_id = f"jarvis-{int(tracker.wall_start)}"
+    return StreamingResponse(
+        iter([sse_line(msg_id, text), "data: [DONE]\n\n"]), media_type="text/event-stream"
+    )
+
+
 # ── Main endpoint ─────────────────────────────────────────────────────────────
 @api.post("/v1/chat/completions")
 async def completions(request: Request):
@@ -467,10 +521,15 @@ async def completions(request: Request):
 
     requested = body.get("model")
     explicit = explicit_model(requested if isinstance(requested, str) else None)
-    wants_trace = requested == "jarvis-trace" or any(t in user_msg.lower() for t in TRACE_TRIGGERS)
+    wants_trace = requested == "jarvis-trace" or request.headers.get("x-jarvis-trace") == "1"
+    tracker = StepTimer()
+
+    stored = trace_followup(messages, TRACES)
+    if stored:
+        return stored_trace_response(stored, bool(wants_stream), tracker)
+
     history = prior_turns(messages, user_msg)
     client_system = system_text(messages)
-    tracker = StepTimer()
     snapshot = current_snapshot()
 
     # Step 1 — parallel classify (labels only) AND early RAG keyword check
@@ -536,31 +595,9 @@ async def completions(request: Request):
         answer = decomp["answer"]
         models_used = decomp["models_used"]
         answer += f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
-        if wants_trace:
-            answer += (
-                f"\n\n---\n**Model trace:**\n- Intent: `{intent}`\n- Labels from: `{label_source}`\n"
-                f"- Tier: `{decision.tier}`\n"
-                f"- Device: `{decision.device}`\n- Deployment: `{decision.deployment}`\n"
-                f"- Degraded: `{str(decision.degraded).lower()}`\n- Reason: {decision.reason}\n"
-                f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n\n" + tracker.summary()
-            )
-
-        return JSONResponse(
-            {
-                "id": f"jarvis-{int(tracker.wall_start)}",
-                "object": "chat.completion",
-                "created": int(tracker.wall_start),
-                "model": "jarvis",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": answer},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
-        )
+        trace = format_trace(intent, decision, bool(rag_context), models_used, label_source, tracker)
+        TRACES.put(answer, trace)
+        return completion_json(tracker, answer + trace if wants_trace else answer)
 
     # Step 3 — streaming path. Heavy calls hold that device's semaphore until the stream ends.
     if wants_stream and not wants_trace and decision.deployment != "decomposer":
@@ -578,14 +615,7 @@ async def completions(request: Request):
             async for token in stream_tokens(
                 decision.deployment, decision.device, stream_messages, max_tokens
             ):
-                chunk = {
-                    "id": msg_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": "jarvis",
-                    "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
+                yield sse_line(msg_id, token)
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
@@ -601,37 +631,9 @@ async def completions(request: Request):
             log.warning("answer call failed deployment=%s reason=%s", decision.deployment, reason)
             return JSONResponse({"error": {"message": f"{decision.deployment}: {reason}"}}, status_code=502)
 
-    if wants_trace:
-        trace = (
-            f"\n\n---\n**Model trace:**\n"
-            f"- Intent: `{intent}`\n"
-            f"- Tier: `{decision.tier}`\n"
-            f"- Device: `{decision.device}`\n"
-            f"- Deployment: `{decision.deployment}`\n"
-            f"- Degraded: `{str(decision.degraded).lower()}`\n"
-            f"- Reason: {decision.reason}\n"
-            f"- RAG used: `{'yes' if rag_context else 'no'}`\n"
-            f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n"
-            f"- Labels from: `{label_source}`\n\n" + tracker.summary()
-        )
-        answer += trace
-
-    return JSONResponse(
-        {
-            "id": f"jarvis-{int(tracker.wall_start)}",
-            "object": "chat.completion",
-            "created": int(tracker.wall_start),
-            "model": "jarvis",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": answer},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        }
-    )
+    trace = format_trace(intent, decision, bool(rag_context), models_used, label_source, tracker)
+    TRACES.put(answer, trace)
+    return completion_json(tracker, answer + trace if wants_trace else answer)
 
 
 # ── Other endpoints ───────────────────────────────────────────────────────────

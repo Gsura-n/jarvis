@@ -60,11 +60,14 @@ _NOT_WORD = re.compile(r"[^\w']+")
 
 
 def asks_for_trace(text: str) -> bool:
-    """A short message that starts or ends with a trace phrase. Longer ones are real questions."""
+    """A short message that is, starts with or ends with a trace phrase, as whole words. Longer ones are real questions."""
     ask = " ".join(_NOT_WORD.sub(" ", text.lower()).split())
     if not ask or len(ask.split()) > MAX_FOLLOWUP_WORDS:
         return False
-    return any(ask.startswith(phrase) or ask.endswith(phrase) for phrase in TRACE_FOLLOWUPS)
+    return any(
+        ask == phrase or ask.startswith(phrase + " ") or ask.endswith(" " + phrase)
+        for phrase in TRACE_FOLLOWUPS
+    )
 
 
 def trace_followup(messages: list[dict], store: TraceStore) -> str | None:
