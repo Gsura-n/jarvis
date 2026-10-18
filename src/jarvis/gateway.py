@@ -183,9 +183,12 @@ def chat(
     temperature: float = 0.3,
     max_tokens: int | None = None,
     _retry: bool = True,
+    **params,
 ) -> str:
-    """Non-streaming chat — returns full response string. Retries once on failure."""
-    payload = {"model": model_alias, "messages": messages, "temperature": temperature}
+    """Non-streaming chat — returns full response string. Retries once on failure.
+
+    Extra params (for example response_format) go to LiteLLM as given."""
+    payload = {"model": model_alias, "messages": messages, "temperature": temperature, **params}
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     try:
@@ -201,7 +204,7 @@ def chat(
         if _retry:
             print(f"[chat] {model_alias} failed ({e}) — retrying once...")
             time.sleep(2)
-            return chat(model_alias, messages, temperature, max_tokens, _retry=False)
+            return chat(model_alias, messages, temperature, max_tokens, _retry=False, **params)
         raise
 
 
