@@ -1,12 +1,11 @@
 """
 Smart Gateway — port 4001
 OpenAI-compatible API that orchestrates:
-  1. Prompt enhancement
-  2. Intent classification
-  3. RAG context (project-aware)
-  4. Model routing + chaining
-  5. Streaming responses
-  6. Model trace on demand with timing + memory
+  1. Intent classification (labels only, ADR 0008)
+  2. RAG context (project-aware)
+  3. Model routing + chaining
+  4. Streaming responses
+  5. Model trace on demand with timing + memory
 """
 
 import asyncio
@@ -33,6 +32,7 @@ from jarvis.budget import (
     history_trim_block,
     token_caps,
 )
+from jarvis.classify import classify
 from jarvis.config import cors_origins, jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
 from jarvis.messages import text_of
@@ -258,86 +258,7 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
         log.exception("stream worker failed deployment=%s", deployment)
 
 
-# ── Step 1 — Enhance + Classify ───────────────────────────────────────────────
-ENHANCE_SYSTEM = """You are a prompt engineer and intent classifier.
-
-Given a user message (possibly casual or brief), do two things:
-1. Rewrite it as a clear, detailed prompt that preserves the original intent but adds helpful context and specificity. Keep it concise — do not pad.
-2. Classify the intent as ONE of: code | reasoning | code+reasoning | general
-
-Rules for classification:
-- code: writing, fixing, reviewing, or explaining specific code — use when asked to show, list, find, or describe code/files
-- reasoning: design decisions, architecture, debugging logic, "why", "how should I" — pure thinking, no code needed
-- code+reasoning: ONLY when user explicitly wants something DESIGNED AND BUILT from scratch — e.g. "design and implement", "create a new feature", "build this"
-- general: concepts, summaries, chat, questions that don't need code or deep reasoning
-
-IMPORTANT: "what does X do", "list my routes", "explain this file", "what are my components" = code (NOT code+reasoning)
-ONLY use code+reasoning when the user clearly wants NEW code written after thinking through a solution.
-
-needs_rag should be true when ANY of these apply:
-- Query mentions "my project", "my code", "my repo", "my file", "this project", "this code"
-- Query is about a specific file, component, function, or feature in a codebase
-- Query mentions specific framework terms like "agent page", "dashboard", "component", "route", "API"
-- Intent is "code" or "code+reasoning"
-
-Respond ONLY with valid JSON, no markdown:
-{
-  "enhanced_prompt": "...",
-  "intent": "code|reasoning|code+reasoning|general",
-  "needs_rag": true|false,
-  "rag_reason": "brief reason or empty string"
-}
-"""
-
-
-def enhance_and_classify(user_message: str, deployment: str = "classify-mini") -> dict:
-    msg_lower = user_message.lower()
-    keyword_rag = any(t in msg_lower for t in RAG_TRIGGERS)
-
-    try:
-        result = chat(
-            deployment,
-            [
-                {"role": "system", "content": ENHANCE_SYSTEM},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,
-        )
-
-        clean = result.strip()
-        for fence in ["```json", "```"]:
-            clean = clean.replace(fence, "")
-        clean = clean.strip()
-
-        start = clean.find("{")
-        end = clean.rfind("}") + 1
-        if start >= 0 and end > start:
-            clean = clean[start:end]
-
-        parsed = json.loads(clean)
-
-    except Exception as e:
-        print(f"[Classify] parse error: {e} — using fallback")
-        intent = "general"
-        if any(w in msg_lower for w in ["write", "build", "create", "implement", "fix", "code", "function"]):
-            intent = "code"
-        elif any(w in msg_lower for w in ["why", "how should", "design", "architect", "explain"]):
-            intent = "reasoning"
-        parsed = {
-            "enhanced_prompt": user_message,
-            "intent": intent,
-            "needs_rag": keyword_rag,
-            "rag_reason": "fallback classifier",
-        }
-
-    if keyword_rag:
-        parsed["needs_rag"] = True
-        if not parsed.get("rag_reason"):
-            parsed["rag_reason"] = "keyword match"
-
-    return parsed
-
-
+# ── Step 1 — History ──────────────────────────────────────────────────────────
 def prior_turns(messages: list, user_msg: str) -> list[dict]:
     """Turns before the latest copy of the current user message."""
     last = None
@@ -374,7 +295,7 @@ def budgeted_messages(
 # ── Step 2 — Execute (non-streaming) ─────────────────────────────────────────
 def execute(
     intent: str,
-    enhanced_prompt: str,
+    user_msg: str,
     rag_context: str,
     tracker: StepTimer,
     history: list | None,
@@ -387,7 +308,7 @@ def execute(
 
     if intent == "general":
         tracker.start("llm_general")
-        messages, max_tokens = budgeted_messages(alias, system_base, enhanced_prompt, rag_context, history)
+        messages, max_tokens = budgeted_messages(alias, system_base, user_msg, rag_context, history)
         answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_general")
         return answer, [label]
@@ -397,7 +318,7 @@ def execute(
         messages, max_tokens = budgeted_messages(
             alias,
             system_base + "\nWrite clean, production-ready code with comments.",
-            enhanced_prompt,
+            user_msg,
             rag_context,
             history,
         )
@@ -411,15 +332,13 @@ def execute(
         if intent == "code+reasoning":
             extra += "\nDesign the solution, then implement it in the same answer."
         tracker.start("llm_reasoning")
-        messages, max_tokens = budgeted_messages(
-            alias, system_base + extra, enhanced_prompt, rag_context, history
-        )
+        messages, max_tokens = budgeted_messages(alias, system_base + extra, user_msg, rag_context, history)
         answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_reasoning")
         return answer, [label]
 
     tracker.start("llm_fallback")
-    messages, max_tokens = budgeted_messages(alias, system_base, enhanced_prompt, rag_context, history)
+    messages, max_tokens = budgeted_messages(alias, system_base, user_msg, rag_context, history)
     answer = chat(alias, messages, max_tokens=max_tokens)
     tracker.end("llm_fallback")
     return answer, [label]
@@ -465,11 +384,11 @@ async def completions(request: Request):
     tracker = StepTimer()
     snapshot = current_snapshot()
 
-    # Step 1 — parallel enhance+classify AND early RAG keyword check
+    # Step 1 — parallel classify (labels only) AND early RAG keyword check
     msg_lower = user_msg.lower()
     keyword_rag = any(t in msg_lower for t in RAG_TRIGGERS)
 
-    tracker.start("enhance_classify")
+    tracker.start("classify")
     tracker.start("rag")
 
     rag_future = None
@@ -477,42 +396,27 @@ async def completions(request: Request):
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         if explicit:
-            meta = {
-                "enhanced_prompt": user_msg,
-                "intent": _EXPLICIT_INTENT[explicit],
-                "needs_rag": keyword_rag,
-                "rag_reason": "explicit model",
-            }
-            classify_future = None
+            labels = {"intent": _EXPLICIT_INTENT[explicit], "complexity": "simple", "needs_rag": False}
+            label_source = "explicit model"
         else:
-            classify_future = executor.submit(enhance_and_classify, user_msg, classify_deployment(snapshot))
+            classify_future = executor.submit(classify, messages, chat, classify_deployment(snapshot))
 
-        # Start RAG early if keyword match detected
+        # Keywords only start retrieval early. They never decide the intent.
         if keyword_rag:
             rag_future = executor.submit(rag_query, user_msg)
 
         if classify_future is not None:
-            try:
-                meta = classify_future.result()
-            except Exception as e:
-                print(f"[Classify] error: {e}")
-                meta = {
-                    "enhanced_prompt": user_msg,
-                    "intent": "general",
-                    "needs_rag": False,
-                    "rag_reason": "",
-                }
+            labels, label_source = classify_future.result()
 
-        tracker.end("enhance_classify")
+        tracker.end("classify")
 
-        enhanced_prompt = meta.get("enhanced_prompt", user_msg)
-        intent = meta.get("intent", "general")
-        needs_rag = meta.get("needs_rag", False)
+        intent = labels["intent"]
+        needs_rag = labels["needs_rag"] or keyword_rag
 
-        # If RAG wasn't started but intent needs it, start now
+        # If RAG wasn't started but the labels need it, start now
         rag_context = ""
         if rag_future is None and (needs_rag or intent in ("code", "code+reasoning")):
-            rag_future = executor.submit(rag_query, enhanced_prompt)
+            rag_future = executor.submit(rag_query, user_msg)
 
         # Get RAG result if running
         if rag_future is not None:
@@ -524,7 +428,7 @@ async def completions(request: Request):
 
         tracker.end("rag")
 
-    decision = decide(intent, str(meta.get("complexity") or ""), explicit, snapshot, settings.topology)
+    decision = decide(intent, labels["complexity"], explicit, snapshot, settings.topology)
     # Degraded design-and-build, or an explicit jarvis-decompose, stays on the mini.
     if prefer_decomposer(intent, explicit, decision, requested == "jarvis-decompose"):
         print("[Decomposer] Routing to task decomposer on the mini...")
@@ -532,7 +436,7 @@ async def completions(request: Request):
         token = bind_snapshot(mini_only(snapshot))
         try:
             async with device_semaphore("mini"):
-                decomp = await asyncio.to_thread(decompose_and_execute, enhanced_prompt, rag_context)
+                decomp = await asyncio.to_thread(decompose_and_execute, user_msg, rag_context)
         finally:
             reset_snapshot(token)
         tracker.end("task_decomposition")
@@ -545,7 +449,8 @@ async def completions(request: Request):
         answer += f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
         if wants_trace:
             answer += (
-                f"\n\n---\n**Model trace:**\n- Intent: `{intent}`\n- Tier: `{decision.tier}`\n"
+                f"\n\n---\n**Model trace:**\n- Intent: `{intent}`\n- Labels from: `{label_source}`\n"
+                f"- Tier: `{decision.tier}`\n"
                 f"- Device: `{decision.device}`\n- Deployment: `{decision.deployment}`\n"
                 f"- Degraded: `{str(decision.degraded).lower()}`\n- Reason: {decision.reason}\n"
                 f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n\n" + tracker.summary()
@@ -576,7 +481,7 @@ async def completions(request: Request):
         elif intent in ("reasoning", "code+reasoning"):
             system_msg += "\nThink step by step. Be thorough."
         stream_messages, max_tokens = budgeted_messages(
-            decision.deployment, system_msg, enhanced_prompt, rag_context, history
+            decision.deployment, system_msg, user_msg, rag_context, history
         )
         msg_id = f"jarvis-{int(time.time())}"
 
@@ -599,7 +504,7 @@ async def completions(request: Request):
     if decision.deployment != "decomposer":
         async with device_semaphore(decision.device):
             answer, models_used = await asyncio.to_thread(
-                execute, intent, enhanced_prompt, rag_context, tracker, history, decision
+                execute, intent, user_msg, rag_context, tracker, history, decision
             )
 
     if wants_trace:
@@ -613,7 +518,7 @@ async def completions(request: Request):
             f"- Reason: {decision.reason}\n"
             f"- RAG used: `{'yes' if rag_context else 'no'}`\n"
             f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n"
-            f"- Enhanced prompt: _{enhanced_prompt}_\n\n" + tracker.summary()
+            f"- Labels from: `{label_source}`\n\n" + tracker.summary()
         )
         answer += trace
 

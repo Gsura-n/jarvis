@@ -1,6 +1,6 @@
 # ADR 0008: Classifier returns labels only; explicit model choice skips it
 
-**Status:** Proposed
+**Status:** Accepted (implemented 2026-10-18)
 **Date:** 2026-09-23
 **Deciders:** Gauttam
 
@@ -46,6 +46,10 @@ B fixes the known bugs with the least new code. C could remove the LLM from the 
 
 ## Action Items
 
-1. [ ] `classify.py` with a JSON schema and last N turns.
-2. [ ] Honor `body["model"]` in the gateway.
-3. [ ] Remove `ENHANCE_SYSTEM` rewrite logic and keyword fallback.
+1. [x] `classify.py` with a JSON schema and last N turns.
+2. [x] Honor `body["model"]` in the gateway.
+3. [x] Remove `ENHANCE_SYSTEM` rewrite logic and keyword fallback.
+- The classifier call is synchronous and uses `chat()`, which passes `response_format` through to LiteLLM. LiteLLM's `ollama` provider maps a `json_schema` response format to Ollama's `format` field (`litellm/llms/ollama/completion/transformation.py:194-195`; the `ollama_chat` provider does the same at `chat/transformation.py:171-173`).
+- Only complexity `complex` selects a large tier. `medium` stays small.
+- The trace line "Labels from" shows `classifier`, `explicit model`, or `fallback: <reason>`.
+- Decision item 3 (trace detection from the conversation) is not part of this change.
