@@ -1,4 +1,4 @@
-"""ADR 0008: classifier module, chat() extra params and the complexity mapping."""
+"""ADR 0008: the classifier returns labels only. The downstream model gets the user's own words."""
 
 import json
 import os
@@ -10,7 +10,7 @@ import pytest  # noqa: E402
 from jarvis import classify  # noqa: E402
 from jarvis.config import settings  # noqa: E402
 from jarvis.policy import decide, pick_tier  # noqa: E402
-from tests.test_day3_policy import BOTH  # noqa: E402
+from tests.test_day3_policy import BOTH, _client, _post, _refuse, auth_headers  # noqa: E402,F401
 
 GOOD = {"intent": "code", "complexity": "simple", "needs_rag": True}
 
@@ -112,6 +112,74 @@ def test_classify_falls_back_when_the_model_call_raises():
     labels, source = classify.classify([{"role": "user", "content": "hi"}], complete)
     assert labels == classify.DEFAULT
     assert source == "fallback: model crashed"
+
+
+def _fake_chat(sent, classifier_reply):
+    def fake(model, messages, *_a, **params):
+        sent.append((model, messages, params))
+        return classifier_reply if model == "classify-mini" else "an answer"
+
+    return fake
+
+
+def test_unparseable_classifier_reply_falls_back_to_general_without_rag(monkeypatch, auth_headers):  # noqa: F811
+    sent, rag_calls = [], []
+    monkeypatch.setattr("jarvis.gateway.chat", _fake_chat(sent, "I am not JSON"))
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *a, **_k: rag_calls.append(a) or "")
+    with _client(monkeypatch) as client:
+        response = _post(client, "tell me a story", model="jarvis-trace", headers=auth_headers)
+    text = response.json()["choices"][0]["message"]["content"]
+    assert response.status_code == 200
+    assert "Intent: `general`" in text
+    assert "fallback" in text
+    assert rag_calls == []
+    assert [m for m, *_ in sent] == ["classify-mini", "general-small-mini"]
+
+
+def test_trace_names_the_classifier_as_the_source(monkeypatch, auth_headers):  # noqa: F811
+    reply = json.dumps({"intent": "general", "complexity": "simple", "needs_rag": False})
+    monkeypatch.setattr("jarvis.gateway.chat", _fake_chat([], reply))
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    with _client(monkeypatch) as client:
+        response = _post(client, "tell me a story", model="jarvis-trace", headers=auth_headers)
+    text = response.json()["choices"][0]["message"]["content"]
+    assert "Labels from: `classifier`" in text
+    assert "Enhanced prompt" not in text
+
+
+def test_downstream_model_gets_the_users_exact_words(monkeypatch, auth_headers):  # noqa: F811
+    sent = []
+    reply = json.dumps({"intent": "general", "complexity": "simple", "needs_rag": False})
+    monkeypatch.setattr("jarvis.gateway.chat", _fake_chat(sent, reply))
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    words = "keep the constraint: no pandas, and answer in 3 bullets"
+    with _client(monkeypatch) as client:
+        response = _post(client, words, headers=auth_headers)
+    assert response.status_code == 200
+    model, messages, _params = sent[-1]
+    assert model == "general-small-mini"
+    assert messages[-1] == {"role": "user", "content": words}
+
+
+def test_keyword_hit_starts_retrieval_but_does_not_choose_the_intent(monkeypatch, auth_headers):  # noqa: F811
+    sent, rag_calls = [], []
+    reply = json.dumps({"intent": "general", "complexity": "simple", "needs_rag": False})
+    monkeypatch.setattr("jarvis.gateway.chat", _fake_chat(sent, reply))
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *a, **_k: rag_calls.append(a) or "")
+    with _client(monkeypatch) as client:
+        response = _post(client, "what is in my repo", model="jarvis-trace", headers=auth_headers)
+    assert "Intent: `general`" in response.json()["choices"][0]["message"]["content"]
+    assert rag_calls == [("what is in my repo",)]
+
+
+@pytest.mark.parametrize("model", ["general", "coding", "reasoning"])
+def test_explicit_model_skips_the_classifier(monkeypatch, auth_headers, model):  # noqa: F811
+    monkeypatch.setattr("jarvis.gateway.classify", _refuse)
+    monkeypatch.setattr("jarvis.gateway.chat", lambda alias, *_a, **_k: f"from {alias}")
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    with _client(monkeypatch) as client:
+        response = _post(client, "reverse a list", model=model, headers=auth_headers)
+    assert response.status_code == 200
 
 
 def test_chat_passes_extra_params_to_litellm(monkeypatch):
