@@ -49,7 +49,11 @@ B fixes the known bugs with the least new code. C could remove the LLM from the 
 1. [x] `classify.py` with a JSON schema and last N turns.
 2. [x] Honor `body["model"]` in the gateway.
 3. [x] Remove `ENHANCE_SYSTEM` rewrite logic and keyword fallback.
+4. [x] Decision item 3: trace on `jarvis-trace` or `X-Jarvis-Trace: 1`; follow-ups answered from stored traces.
 - The classifier call is synchronous and uses `chat()`, which passes `response_format` through to LiteLLM. LiteLLM's `ollama` provider maps a `json_schema` response format to Ollama's `format` field (`litellm/llms/ollama/completion/transformation.py:194-195`; the `ollama_chat` provider does the same at `chat/transformation.py:171-173`).
 - Only complexity `complex` selects a large tier. `medium` stays small.
 - The trace line "Labels from" shows `classifier`, `explicit model`, or `fallback: <reason>`.
-- Decision item 3 (trace detection from the conversation) is not part of this change.
+- Decision item 3 is implemented. The keyword triggers are gone. A trace is appended to the current answer only for the `jarvis-trace` model or the header `X-Jarvis-Trace: 1`, streamed or not; a streamed trace is the last content chunk before `[DONE]`, built after the stream ends.
+- Every successful answer, streamed or not, stores its trace in `TraceStore` (last 256, keyed by a hash of the cleaned answer text). A failed answer (502 or a `[Jarvis]` stream failure) stores none.
+- A latest user message of 8 words or fewer that is, starts with or ends with a phrase in `TRACE_FOLLOWUPS` as whole words ("show trace", "which model answered", ...) returns the stored trace for the previous assistant answer with no model call. Assistant messages that are themselves a returned trace are skipped, so asking twice returns the same trace. With no stored trace it is a normal question, as is any longer message.
+- `TRACE_MARK` in `messages.py` is the one marker. `clean_assistant()` cuts from it, so a replayed trace never reaches a model.

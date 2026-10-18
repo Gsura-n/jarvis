@@ -251,7 +251,9 @@ def _stream_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=600.0, write=600.0, pool=5.0))
 
 
-async def stream_tokens(deployment: str, device: str, messages: list, max_tokens: int):
+async def stream_tokens(
+    deployment: str, device: str, messages: list, max_tokens: int, outcome: dict | None = None
+):
     """Yield tokens for one heavy call.
 
     The read runs on the event loop. Cancelling it closes the HTTP connection
@@ -259,7 +261,7 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
 
     Thinking (reasoning_content) is yielded inside a <think> block that closes before
     the first answer token. An upstream or transport error ends the stream with one
-    "[Jarvis] <deployment>: <reason>" token.
+    "[Jarvis] <deployment>: <reason>" token and sets outcome["failed"] when a dict is given.
     """
     payload = {
         "model": deployment,
@@ -317,6 +319,8 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
     if thinking:
         yield "\n</think>\n\n"
     if failure:
+        if outcome is not None:
+            outcome["failed"] = True
         log.warning("upstream error deployment=%s reason=%s", deployment, failure)
         yield f"\n\n[Jarvis] {deployment}: {failure}"
 
@@ -600,7 +604,7 @@ async def completions(request: Request):
         return completion_json(tracker, answer + trace if wants_trace else answer)
 
     # Step 3 — streaming path. Heavy calls hold that device's semaphore until the stream ends.
-    if wants_stream and not wants_trace and decision.deployment != "decomposer":
+    if wants_stream and decision.deployment != "decomposer":
         system_msg = f"You are a helpful expert assistant. {REFERENCE_RULE}"
         if intent == "code":
             system_msg += "\nWrite clean, production-ready code with comments."
@@ -612,10 +616,22 @@ async def completions(request: Request):
         msg_id = f"jarvis-{int(time.time())}"
 
         async def stream_generator():
+            outcome: dict = {}
+            parts: list[str] = []
+            tracker.start("llm_stream")
             async for token in stream_tokens(
-                decision.deployment, decision.device, stream_messages, max_tokens
+                decision.deployment, decision.device, stream_messages, max_tokens, outcome
             ):
+                parts.append(token)
                 yield sse_line(msg_id, token)
+            tracker.end("llm_stream")
+            if not outcome.get("failed"):
+                # Built after the stream ends, so the timings are real. A failed stream gets no trace.
+                label = f"{decision.deployment} ({decision.device})"
+                trace = format_trace(intent, decision, bool(rag_context), [label], label_source, tracker)
+                TRACES.put("".join(parts), trace)
+                if wants_trace:
+                    yield sse_line(msg_id, trace)
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")

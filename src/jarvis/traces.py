@@ -5,7 +5,7 @@ import re
 import threading
 from collections import OrderedDict
 
-from jarvis.messages import clean_assistant, text_of
+from jarvis.messages import TRACE_MARK, clean_assistant, text_of
 
 # Phrases that ask how the PREVIOUS answer was produced. Kept narrow on purpose:
 # "which model should I use for X" and "why did you pick Postgres?" are real questions.
@@ -76,6 +76,9 @@ def trace_followup(messages: list[dict], store: TraceStore) -> str | None:
     if end < 0 or not asks_for_trace(text_of(messages[end].get("content"))):
         return None
     for message in reversed(messages[:end]):
-        if message.get("role") == "assistant":
-            return store.get(text_of(message.get("content")))
+        if message.get("role") != "assistant":
+            continue
+        text = text_of(message.get("content"))
+        if not text.strip().startswith(TRACE_MARK.strip()):  # a trace we returned, not an answer
+            return store.get(text)
     return None
