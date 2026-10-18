@@ -1,10 +1,10 @@
-# LiteLLM proxy config. Secrets are pulled from the environment (loaded from ~/.jarvis.env by scripts/start.sh).
-# Deployment names match jarvis.yaml. num_ctx is an Ollama option: LiteLLM copies
-# it into the request options, which is what sets the context window.
+# LiteLLM proxy config. Secrets come from the environment (scripts/start.sh loads ~/.jarvis.env).
+# One model_name per concrete deployment. Names and num_ctx match jarvis.yaml.
+# num_ctx is an Ollama option. LiteLLM copies it into the request's options object,
+# which is what Ollama reads as the context window. Without it, Ollama stays at 4K.
 
 model_list:
-  # ── Mac mini (small tier) ──────────────────────────────────────────────
-  - model_name: classifier
+  - model_name: classify-mini
     litellm_params:
       model: ollama/llama3.2:3b
       api_base: http://localhost:11434
@@ -16,26 +16,44 @@ model_list:
       api_base: http://localhost:11434
       num_ctx: 8192
 
-  - model_name: general
+  - model_name: general-small-mini
     litellm_params:
       model: ollama/llama3.1:8b
       api_base: http://localhost:11434
       num_ctx: 8192
 
-  - model_name: coding
+  - model_name: code-small-mini
     litellm_params:
       model: ollama/qwen2.5-coder:7b
       api_base: http://localhost:11434
       num_ctx: 8192
 
-  - model_name: reasoning
+  - model_name: code-large-mini
     litellm_params:
-      model: ollama/deepseek-r1:8b
+      model: ollama/qwen2.5-coder:7b
       api_base: http://localhost:11434
       num_ctx: 8192
 
-  # ── MacBook Pro (large tier) ───────────────────────────────────────────
-  - model_name: large-mbp
+  # deepseek-r1:8b is used only here. Same model elsewhere must share this num_ctx or Ollama reloads it.
+  - model_name: reasoning-large-mini
+    litellm_params:
+      model: ollama/deepseek-r1:8b
+      api_base: http://localhost:11434
+      num_ctx: 16384
+
+  - model_name: judge-mini
+    litellm_params:
+      model: ollama/llama3.1:8b
+      api_base: http://localhost:11434
+      num_ctx: 8192
+
+  - model_name: reasoning-large-mbp
+    litellm_params:
+      model: ollama/qwen3:30b-a3b-instruct-2507-q4_K_M
+      api_base: http://10.0.0.47:11434
+      num_ctx: 32768
+
+  - model_name: code-large-mbp
     litellm_params:
       model: ollama/qwen3:30b-a3b-instruct-2507-q4_K_M
       api_base: http://10.0.0.47:11434

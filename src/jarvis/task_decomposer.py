@@ -10,6 +10,7 @@ Features:
   - Shared context bus across agents
 """
 
+import contextvars
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,7 +19,17 @@ from typing import TypedDict
 import requests
 from langgraph.graph import END, StateGraph
 
+from jarvis.budget import (
+    REFERENCE_RULE,
+    answer_token_budget,
+    assemble_messages,
+    context_window,
+    history_trim_block,
+    token_caps,
+)
 from jarvis.config import settings
+from jarvis.policy import decide
+from jarvis.registry import current_snapshot
 from jarvis.subtask_tracer import traced_stream_call
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -38,10 +49,17 @@ class JarvisState(TypedDict):
     error: str | None
 
 
+def routed(intent: str):
+    """Deployment for one subtask. Uses the snapshot the gateway pinned for this request."""
+    return decide(intent, "", None, current_snapshot(), settings.topology)
+
+
 # ── LiteLLM helper ────────────────────────────────────────────────────────────
 def call_model(
     model: str, system: str, user: str, temperature: float = 0.3, max_tokens: int = 3000, _retry: bool = True
 ) -> str:
+    if model == "general":
+        model = routed("general").deployment or "general-small-mini"
     try:
         r = requests.post(
             f"{LITELLM_BASE}/chat/completions",
@@ -219,13 +237,7 @@ def split_tasks(state: JarvisState) -> JarvisState:
         }
 
 
-# ── Node 3 — Parallel Task Executor with Structured Handoff ───────────────────
-INTENT_TO_MODEL = {
-    "code": "coding",
-    "reasoning": "reasoning",
-    "general": "general",
-}
-
+# ── Node 3 — Task executor with structured handoff ────────────────────────────
 INTENT_SYSTEM = {
     "code": "You are an expert coder. Write clean, production-ready code with comments.",
     "reasoning": "You are an expert architect. Be DECISIVE. Briefly consider the key options, then COMMIT to a clear recommendation. Do NOT enumerate every possibility or keep second-guessing — pick the best approach and justify it concisely. State your final recommendation explicitly and clearly. Aim to conclude within a few paragraphs.",
@@ -239,11 +251,7 @@ it considered, rejected, and recommended. Your job is to IMPLEMENT the recommend
 approach. Do not re-think the architecture; build on the reasoning provided.
 Write clean, production-ready code with comments.
 
-=== FULL REASONING HANDOFF ===
-{reasoning}
-=== END HANDOFF ===
-
-Implement the recommended approach. Avoid the rejected approaches."""
+The handoff follows. Implement the recommended approach and avoid the rejected ones."""
 
 
 def is_broken_result(text: str) -> bool:
@@ -257,7 +265,7 @@ def is_broken_result(text: str) -> bool:
 def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict:
     """Execute one subtask. Used by both parallel and sequential paths."""
     intent = subtask.get("intent", "general")
-    model = INTENT_TO_MODEL.get(intent, "general")
+    model = routed(intent).deployment or "general-small-mini"
     implements = subtask.get("implements")
     if isinstance(implements, list):
         implements = implements[0] if implements else None
@@ -283,35 +291,38 @@ def run_single_subtask(subtask: dict, completed: dict, rag_context: str) -> dict
     )
 
     if handoff_ok:
-        reasoning_full = completed[implements]["result"]
-        system = HANDOFF_SYSTEM.format(reasoning=reasoning_full)
-        if rag_context:
-            system += f"\n\nCodebase context:\n{rag_context}"
+        system = HANDOFF_SYSTEM
+        handoff = completed[implements]["result"]
         user_prompt = f"Implement: {subtask['task']}"
         tag = f"(handoff from #{implements})"
     else:
         system = INTENT_SYSTEM.get(intent, INTENT_SYSTEM["general"])
-        if rag_context:
-            system += f"\n\nCodebase context:\n{rag_context}"
-        user_prompt = f"{subtask['task']}{dep_context}"
-        if implements and not handoff_ok:
-            tag = "(standalone — handoff source was broken)"
-        else:
-            tag = ""
+        handoff = dep_context
+        user_prompt = subtask["task"]
+        tag = "(standalone — handoff source was broken)" if implements else ""
 
     print(f"   → [{subtask['id']}] {subtask['task'][:50]}... ({model}) {tag}")
-    # Reasoning models spend tokens thinking before answering, so give them
-    # a larger budget AND more wall-clock time. Code/general are faster.
-    if model == "reasoning":
-        token_budget = 6000
-        wall_limit = 420  # 7 min — DeepSeek is thorough but slow
-    else:
-        token_budget = 4000
-        wall_limit = 300  # 5 min
+    system = f"{system}\n{REFERENCE_RULE}"
+    token_budget = answer_token_budget(model, settings.topology)
+    walls = settings.topology.get("budgets", {}).get("subtask_wall_s", {})
+    # A degraded -large fallback is still slow, so it keeps the longer clock.
+    wall_key = "large" if "-large" in model else "small"
+    wall_limit = int(walls.get(wall_key, 420 if wall_key == "large" else 300))
+    messages = assemble_messages(
+        system=system,
+        history=[],
+        rag=rag_context,
+        handoff=handoff,
+        user=user_prompt,
+        max_tokens=token_budget,
+        num_ctx=context_window(settings.topology, model),
+        caps=token_caps(settings.topology),
+        block=history_trim_block(settings.topology),
+    )
     result_text = traced_stream_call(
         model,
-        system,
-        user_prompt,
+        messages[0]["content"],
+        messages[-1]["content"],
         subtask_id=subtask["id"],
         task_desc=subtask["task"][:80],
         max_tokens=token_budget,
@@ -387,7 +398,12 @@ def execute_tasks_parallel(state: JarvisState) -> JarvisState:
             remaining.remove(ready[0])
         else:
             with ThreadPoolExecutor(max_workers=min(len(ready), 3)) as ex:
-                futures = {ex.submit(run_single_subtask, t, completed, rag_context): t for t in ready}
+                futures = {
+                    ex.submit(
+                        contextvars.copy_context().run, run_single_subtask, t, completed, rag_context
+                    ): t
+                    for t in ready
+                }
                 for fut in as_completed(futures):
                     res = fut.result()
                     completed[res["id"]] = res
@@ -538,9 +554,11 @@ def decompose_and_execute(prompt: str, rag_context: str = "") -> dict:
         "error": None,
     }
     final_state = graph.invoke(initial_state)
-    models_used = list(
-        set(INTENT_TO_MODEL.get(r["intent"], "general") for r in final_state.get("results", []))
-    )
+    models_used = []
+    for row in final_state.get("results", []):
+        name = routed(row.get("intent", "general")).deployment
+        if name and name not in models_used:
+            models_used.append(name)
     return {
         "answer": final_state.get("final_answer", ""),
         "complexity": final_state.get("complexity", "simple"),

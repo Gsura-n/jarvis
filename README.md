@@ -53,7 +53,7 @@ cp .env.example ~/.jarvis.env    # then fill in every value
 ./scripts/stop.sh
 ```
 
-Point any OpenAI compatible client at `http://localhost:4001/v1`. Ask "which model answered?" or "show trace" at the end of a question to get the routing and timing trace appended to the answer.
+Point any OpenAI compatible client at `http://localhost:4001/v1`. Open WebUI and Continue must send the value of `JARVIS_API_KEY` as the API key for the Jarvis connection. Every route except `GET /health` rejects a missing or wrong key. Ask "which model answered?" or "show trace" at the end of a question to get the routing and timing trace appended to the answer.
 
 Logs and traces land in `.logs/` (gitignored). Topology, tiers and budgets are in `jarvis.yaml`; secrets are only ever in `~/.jarvis.env`.
 

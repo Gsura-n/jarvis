@@ -9,21 +9,37 @@ OpenAI-compatible API that orchestrates:
   6. Model trace on demand with timing + memory
 """
 
+import asyncio
+import hmac
 import json
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, suppress
 
+import httpx
 import requests
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
+from starlette.middleware.cors import CORSMiddleware
 
-from jarvis.budget import answer_token_budget, assemble_messages, context_window
-from jarvis.config import settings
+from jarvis.budget import (
+    REFERENCE_RULE,
+    answer_token_budget,
+    assemble_messages,
+    context_window,
+    history_trim_block,
+    token_caps,
+)
+from jarvis.config import cors_origins, jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
+from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
+from jarvis.registry import Registry, bind_snapshot, current_snapshot, mini_only, reset_snapshot, set_registry
 from jarvis.task_decomposer import decompose_and_execute
+
+log = logging.getLogger("jarvis.gateway")
 
 # ── Config — everything comes from jarvis.config (env file + jarvis.yaml) ─────
 LITELLM_BASE = settings.litellm_base
@@ -40,11 +56,8 @@ if _missing:
     print(f"⚠️  Missing required env vars: {', '.join(_missing)}")
     print(f"   Add them to {settings.env_file}")
 
-MODELS = {
-    "general": "general",
-    "code": "coding",
-    "reasoning": "reasoning",
-}
+_EXPLICIT_INTENT = {"general": "general", "coding": "code", "reasoning": "reasoning"}
+_semaphores: dict[str, asyncio.Semaphore] = {}
 
 TRACE_TRIGGERS = [
     "which model",
@@ -76,16 +89,47 @@ RAG_TRIGGERS = [
     "component",
 ]
 
-app = FastAPI(title="Jarvis Smart Gateway")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
-)
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    if not jarvis_api_key():
+        log.error("JARVIS_API_KEY is empty; every protected route will return 401")
+    registry = Registry(settings.topology)
+    set_registry(registry)
+    await registry.poll_once()
+    task = asyncio.create_task(registry.run())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        set_registry(None)
+
 
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
 try:
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 except Exception:
     driver = None
+
+
+def explicit_model(name: str | None) -> str | None:
+    return name if name in _EXPLICIT_INTENT else None
+
+
+def device_semaphore(device: str) -> asyncio.Semaphore:
+    """One heavy call at a time per machine. Classifier and embedder do not take this."""
+    sem = _semaphores.get(device)
+    if sem is None:
+        raw = settings.topology.get("devices", {}).get(device, {}).get("heavy_concurrency", 1)
+        sem = asyncio.Semaphore(max(1, int(raw)))
+        _semaphores[device] = sem
+    return sem
+
+
+def classify_deployment(snapshot) -> str:
+    return walk_tier("classify", snapshot, settings.topology, "classify").deployment or "classify-mini"
 
 
 def get_embedding(text: str) -> list:
@@ -160,29 +204,54 @@ def chat(
         raise
 
 
-def chat_stream(model_alias: str, messages: list, temperature: float = 0.3, max_tokens: int | None = None):
-    """Streaming chat — yields tokens as they arrive from LiteLLM."""
-    payload = {"model": model_alias, "messages": messages, "temperature": temperature, "stream": True}
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    r = requests.post(
-        f"{LITELLM_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-        json=payload,
-        timeout=600,
-        stream=True,
-    )
-    for line in r.iter_lines():
-        if line:
-            decoded = line.decode("utf-8")
-            if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                try:
-                    chunk = json.loads(decoded[6:])
-                    delta = chunk["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        yield delta
-                except Exception:
-                    pass
+def _stream_client() -> httpx.AsyncClient:
+    """Async LiteLLM client. Tests swap this to inject a transport."""
+    return httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=600.0, write=600.0, pool=5.0))
+
+
+async def stream_tokens(deployment: str, device: str, messages: list, max_tokens: int):
+    """Yield tokens for one heavy call.
+
+    The read runs on the event loop. Cancelling it closes the HTTP connection
+    before the device semaphore is released. CancelledError is not caught.
+    """
+    payload = {
+        "model": deployment,
+        "messages": messages,
+        "temperature": 0.3,
+        "stream": True,
+        "max_tokens": max_tokens,
+    }
+    skipped = 0
+    try:
+        async with device_semaphore(device):
+            async with _stream_client() as client:
+                async with client.stream(
+                    "POST",
+                    f"{LITELLM_BASE}/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {LITELLM_KEY}"},
+                ) as response:
+                    response.raise_for_status()
+                    try:
+                        async for line in response.aiter_lines():
+                            if not line or not line.startswith("data: ") or line == "data: [DONE]":
+                                continue
+                            try:
+                                chunk = json.loads(line[6:])
+                                delta = chunk["choices"][0]["delta"].get("content", "")
+                            except Exception:
+                                skipped += 1
+                                continue
+                            if delta:
+                                yield delta
+                    finally:
+                        if skipped:
+                            log.warning(
+                                "skipped %s unreadable stream lines deployment=%s", skipped, deployment
+                            )
+    except Exception:
+        log.exception("stream worker failed deployment=%s", deployment)
 
 
 # ── Step 1 — Enhance + Classify ───────────────────────────────────────────────
@@ -217,13 +286,13 @@ Respond ONLY with valid JSON, no markdown:
 """
 
 
-def enhance_and_classify(user_message: str) -> dict:
+def enhance_and_classify(user_message: str, deployment: str = "classify-mini") -> dict:
     msg_lower = user_message.lower()
     keyword_rag = any(t in msg_lower for t in RAG_TRIGGERS)
 
     try:
         result = chat(
-            "classifier",
+            deployment,
             [
                 {"role": "system", "content": ENHANCE_SYSTEM},
                 {"role": "user", "content": user_message},
@@ -292,6 +361,8 @@ def budgeted_messages(
         user=user,
         max_tokens=max_tokens,
         num_ctx=context_window(settings.topology, alias),
+        caps=token_caps(settings.topology),
+        block=history_trim_block(settings.topology),
     )
     return messages, max_tokens
 
@@ -302,84 +373,73 @@ def execute(
     enhanced_prompt: str,
     rag_context: str,
     tracker: StepTimer,
-    history: list | None = None,
+    history: list | None,
+    decision: Decision,
 ) -> tuple[str, list[str]]:
-    system_base = "You are a helpful expert assistant."
+    system_base = f"You are a helpful expert assistant. {REFERENCE_RULE}"
     history = history or []
+    alias = decision.deployment
+    label = f"{alias} ({decision.device})"
 
     if intent == "general":
         tracker.start("llm_general")
-        messages, max_tokens = budgeted_messages(
-            "general", system_base, enhanced_prompt, rag_context, history
-        )
-        answer = chat("general", messages, max_tokens=max_tokens)
+        messages, max_tokens = budgeted_messages(alias, system_base, enhanced_prompt, rag_context, history)
+        answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_general")
-        return answer, ["general (llama3.1:8b)"]
+        return answer, [label]
 
     if intent == "code":
         tracker.start("llm_code")
         messages, max_tokens = budgeted_messages(
-            "coding",
+            alias,
             system_base + "\nWrite clean, production-ready code with comments.",
             enhanced_prompt,
             rag_context,
             history,
         )
-        answer = chat("coding", messages, max_tokens=max_tokens)
+        answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_code")
-        return answer, ["coding (qwen2.5-coder:7b)"]
+        return answer, [label]
 
-    if intent == "reasoning":
+    if intent == "reasoning" or intent == "code+reasoning":
+        # code+reasoning is one call when the large tier is really available (ADR 0007).
+        extra = "\nThink step by step. Be thorough."
+        if intent == "code+reasoning":
+            extra += "\nDesign the solution, then implement it in the same answer."
         tracker.start("llm_reasoning")
         messages, max_tokens = budgeted_messages(
-            "reasoning",
-            system_base + "\nThink step by step. Be thorough.",
-            enhanced_prompt,
-            rag_context,
-            history,
+            alias, system_base + extra, enhanced_prompt, rag_context, history
         )
-        answer = chat("reasoning", messages, max_tokens=max_tokens)
+        answer = chat(alias, messages, max_tokens=max_tokens)
         tracker.end("llm_reasoning")
-        return answer, ["reasoning (deepseek-r1:8b)"]
+        return answer, [label]
 
-    if intent == "code+reasoning":
-        tracker.start("llm_reasoning")
-        messages, max_tokens = budgeted_messages(
-            "reasoning",
-            system_base + "\nThink step by step. Produce a clear solution design.",
-            enhanced_prompt,
-            rag_context,
-            history,
-        )
-        reasoning_answer = chat("reasoning", messages, max_tokens=max_tokens)
-        tracker.end("llm_reasoning")
-
-        tracker.start("llm_code")
-        coding_prompt = f"Based on this solution design:\n\n{reasoning_answer}\n\nNow implement the code for:\n{enhanced_prompt}"
-        messages, max_tokens = budgeted_messages(
-            "coding",
-            system_base + "\nWrite clean, production-ready code with comments.",
-            coding_prompt,
-            rag_context,
-            history,
-            handoff=reasoning_answer,
-        )
-        code_answer = chat("coding", messages, max_tokens=max_tokens)
-        tracker.end("llm_code")
-
-        combined = f"{reasoning_answer}\n\n---\n\n### Implementation\n\n{code_answer}"
-        return combined, ["reasoning (deepseek-r1:8b)", "coding (qwen2.5-coder:7b)"]
-
-    # fallback
     tracker.start("llm_fallback")
-    messages, max_tokens = budgeted_messages("general", system_base, enhanced_prompt, rag_context, history)
-    answer = chat("general", messages, max_tokens=max_tokens)
+    messages, max_tokens = budgeted_messages(alias, system_base, enhanced_prompt, rag_context, history)
+    answer = chat(alias, messages, max_tokens=max_tokens)
     tracker.end("llm_fallback")
-    return answer, ["general (llama3.1:8b)"]
+    return answer, [label]
+
+
+def require_api_key(request: Request) -> None:
+    """Shared key check. There are no roles yet: missing or wrong key is 401."""
+    expected = jarvis_api_key()
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    ok = (
+        scheme.lower() == "bearer"
+        and bool(expected)
+        and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
+    )
+    if not ok:
+        raise HTTPException(status_code=401, detail="missing or invalid api key")
+
+
+# One dependency for every route except GET /health.
+api = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 # ── Main endpoint ─────────────────────────────────────────────────────────────
-@app.post("/v1/chat/completions")
+@api.post("/v1/chat/completions")
 async def completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
@@ -394,9 +454,12 @@ async def completions(request: Request):
     if not user_msg:
         return JSONResponse({"error": "No user message found"}, status_code=400)
 
-    wants_trace = any(t in user_msg.lower() for t in TRACE_TRIGGERS)
+    requested = body.get("model")
+    explicit = explicit_model(requested if isinstance(requested, str) else None)
+    wants_trace = requested == "jarvis-trace" or any(t in user_msg.lower() for t in TRACE_TRIGGERS)
     history = prior_turns(messages, user_msg)
     tracker = StepTimer()
+    snapshot = current_snapshot()
 
     # Step 1 — parallel enhance+classify AND early RAG keyword check
     msg_lower = user_msg.lower()
@@ -409,19 +472,32 @@ async def completions(request: Request):
     classify_future = None
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        # Always start classify
-        classify_future = executor.submit(enhance_and_classify, user_msg)
+        if explicit:
+            meta = {
+                "enhanced_prompt": user_msg,
+                "intent": _EXPLICIT_INTENT[explicit],
+                "needs_rag": keyword_rag,
+                "rag_reason": "explicit model",
+            }
+            classify_future = None
+        else:
+            classify_future = executor.submit(enhance_and_classify, user_msg, classify_deployment(snapshot))
 
         # Start RAG early if keyword match detected
         if keyword_rag:
             rag_future = executor.submit(rag_query, user_msg)
 
-        # Get classify result
-        try:
-            meta = classify_future.result()
-        except Exception as e:
-            print(f"[Classify] error: {e}")
-            meta = {"enhanced_prompt": user_msg, "intent": "general", "needs_rag": False, "rag_reason": ""}
+        if classify_future is not None:
+            try:
+                meta = classify_future.result()
+            except Exception as e:
+                print(f"[Classify] error: {e}")
+                meta = {
+                    "enhanced_prompt": user_msg,
+                    "intent": "general",
+                    "needs_rag": False,
+                    "rag_reason": "",
+                }
 
         tracker.end("enhance_classify")
 
@@ -444,21 +520,32 @@ async def completions(request: Request):
 
         tracker.end("rag")
 
-    # Step 3 — check if task needs decomposition
-    if intent == "code+reasoning" and not wants_trace:
-        print("[Decomposer] Routing to task decomposer...")
+    decision = decide(intent, str(meta.get("complexity") or ""), explicit, snapshot, settings.topology)
+    # Degraded design-and-build, or an explicit jarvis-decompose, stays on the mini.
+    if prefer_decomposer(intent, explicit, decision, requested == "jarvis-decompose"):
+        print("[Decomposer] Routing to task decomposer on the mini...")
         tracker.start("task_decomposition")
-        # Run decomposer in a worker thread so the async event loop isn't blocked.
-        # Use asyncio.to_thread (clean, no manual executor management).
-        import asyncio
-
-        decomp = await asyncio.to_thread(decompose_and_execute, enhanced_prompt, rag_context)
+        token = bind_snapshot(mini_only(snapshot))
+        try:
+            async with device_semaphore("mini"):
+                decomp = await asyncio.to_thread(decompose_and_execute, enhanced_prompt, rag_context)
+        finally:
+            reset_snapshot(token)
         tracker.end("task_decomposition")
+        decision = Decision(
+            decision.tier, "decomposer", "mini", True, decision.reason + "; decomposer on mini"
+        )
 
         answer = decomp["answer"]
         models_used = decomp["models_used"]
-        subtask_info = f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
-        answer += subtask_info
+        answer += f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
+        if wants_trace:
+            answer += (
+                f"\n\n---\n**Model trace:**\n- Intent: `{intent}`\n- Tier: `{decision.tier}`\n"
+                f"- Device: `{decision.device}`\n- Deployment: `{decision.deployment}`\n"
+                f"- Degraded: `{str(decision.degraded).lower()}`\n- Reason: {decision.reason}\n"
+                f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n\n" + tracker.summary()
+            )
 
         return JSONResponse(
             {
@@ -477,22 +564,22 @@ async def completions(request: Request):
             }
         )
 
-    # Step 3 — streaming path (simple intents only, no trace, no chaining)
-    if wants_stream and not wants_trace and intent != "code+reasoning":
-        model_alias = MODELS.get(intent, "general")
-        system_msg = "You are a helpful expert assistant."
+    # Step 3 — streaming path. Heavy calls hold that device's semaphore until the stream ends.
+    if wants_stream and not wants_trace and decision.deployment != "decomposer":
+        system_msg = f"You are a helpful expert assistant. {REFERENCE_RULE}"
         if intent == "code":
             system_msg += "\nWrite clean, production-ready code with comments."
-        elif intent == "reasoning":
+        elif intent in ("reasoning", "code+reasoning"):
             system_msg += "\nThink step by step. Be thorough."
         stream_messages, max_tokens = budgeted_messages(
-            model_alias, system_msg, enhanced_prompt, rag_context, history
+            decision.deployment, system_msg, enhanced_prompt, rag_context, history
         )
-
         msg_id = f"jarvis-{int(time.time())}"
 
-        def stream_generator():
-            for token in chat_stream(model_alias, stream_messages, max_tokens=max_tokens):
+        async def stream_generator():
+            async for token in stream_tokens(
+                decision.deployment, decision.device, stream_messages, max_tokens
+            ):
                 chunk = {
                     "id": msg_id,
                     "object": "chat.completion.chunk",
@@ -505,14 +592,21 @@ async def completions(request: Request):
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-    # Step 3 — non-streaming execute
-    answer, models_used = execute(intent, enhanced_prompt, rag_context, tracker, history)
+    if decision.deployment != "decomposer":
+        async with device_semaphore(decision.device):
+            answer, models_used = await asyncio.to_thread(
+                execute, intent, enhanced_prompt, rag_context, tracker, history, decision
+            )
 
-    # Step 4 — trace
     if wants_trace:
         trace = (
             f"\n\n---\n**Model trace:**\n"
             f"- Intent: `{intent}`\n"
+            f"- Tier: `{decision.tier}`\n"
+            f"- Device: `{decision.device}`\n"
+            f"- Deployment: `{decision.deployment}`\n"
+            f"- Degraded: `{str(decision.degraded).lower()}`\n"
+            f"- Reason: {decision.reason}\n"
             f"- RAG used: `{'yes' if rag_context else 'no'}`\n"
             f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n"
             f"- Enhanced prompt: _{enhanced_prompt}_\n\n" + tracker.summary()
@@ -538,12 +632,16 @@ async def completions(request: Request):
 
 
 # ── Other endpoints ───────────────────────────────────────────────────────────
-@app.get("/health")
+@api.get("/devices")
+def list_devices():
+    return current_snapshot().as_dict()
+
+
 def health():
     return {"status": "ok", "gateway": "jarvis", "port": 4001}
 
 
-@app.get("/v1/models")
+@api.get("/v1/models")
 def list_models():
     return {
         "object": "list",
@@ -551,18 +649,44 @@ def list_models():
             {"id": "coding", "object": "model", "owned_by": "jarvis"},
             {"id": "reasoning", "object": "model", "owned_by": "jarvis"},
             {"id": "general", "object": "model", "owned_by": "jarvis"},
+            {"id": "jarvis-trace", "object": "model", "owned_by": "jarvis"},
+            {"id": "jarvis-decompose", "object": "model", "owned_by": "jarvis"},
         ],
     }
 
 
-@app.get("/v1/openapi.json")
+@api.get("/v1/openapi.json")
 def openapi_spec():
     return {"openapi": "3.0.0", "info": {"title": "Jarvis Gateway", "version": "1.0.0"}, "paths": {}}
 
 
-@app.get("/v1/api/config")
+@api.get("/v1/api/config")
 def api_config():
     return {"status": "ok", "name": "Jarvis Gateway", "version": "1.0.0"}
+
+
+def create_app() -> FastAPI:
+    """Build the gateway. CORS origins are fixed at build time, so tests call this after setenv."""
+    application = FastAPI(
+        title="Jarvis Smart Gateway",
+        lifespan=_lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins(),
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+    application.include_router(api)
+    application.add_api_route("/health", health, methods=["GET"])
+    return application
+
+
+app = create_app()
 
 
 if __name__ == "__main__":
