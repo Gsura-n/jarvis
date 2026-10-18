@@ -1,4 +1,4 @@
-"""History hygiene through the gateway: no replayed trace appendix, client system messages after ours."""
+"""History hygiene and traces through the gateway (ADR 0008 decision item 3)."""
 
 import json
 import os
@@ -17,12 +17,14 @@ from jarvis.budget import (  # noqa: E402
     token_caps,
 )
 from jarvis.messages import TRACE_MARK  # noqa: E402
+from jarvis.traces import TraceStore  # noqa: E402
 from tests.test_day3_budget import _turn_text, _yaml  # noqa: E402
-from tests.test_day3_policy import _client  # noqa: E402
+from tests.test_day3_policy import _client, _refuse  # noqa: E402
 from tests.test_day4_errors import _mock_stream, _sse  # noqa: E402
 
 APPENDIX = f"{TRACE_MARK}\n- Intent: `general`\n- Labels from: `explicit model`"
 LABELS = ({"intent": "general", "complexity": "simple", "needs_rag": False}, "classifier")
+TRACE_ON = {"X-Jarvis-Trace": "1"}
 
 
 @pytest.fixture
@@ -34,6 +36,7 @@ def auth(monkeypatch):
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     gateway._semaphores.clear()
+    monkeypatch.setattr(gateway, "TRACES", TraceStore())
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     monkeypatch.setattr("jarvis.gateway.classify", lambda *_a, **_k: LABELS)
     yield
@@ -61,6 +64,12 @@ def _ask(client, messages, auth, model="general", stream=False, extra=None):
 
 def _text(response):
     return response.json()["choices"][0]["message"]["content"]
+
+
+def _sse_contents(response):
+    lines = [x[6:] for x in response.text.splitlines() if x.startswith("data: ")]
+    assert lines[-1] == "[DONE]"
+    return [json.loads(x)["choices"][0]["delta"]["content"] for x in lines[:-1]]
 
 
 def _upstream(*deltas, status=200):
@@ -112,6 +121,86 @@ def test_streamed_answers_get_the_client_system_message_too(monkeypatch, auth):
         _ask(client, messages, auth, stream=True)
     system = captured["body"]["messages"][0]["content"]
     assert system.startswith("You are a helpful expert assistant.") and system.endswith("\n\nBe terse.")
+
+
+# ── follow-ups ────────────────────────────────────────────────────────────────
+def _followup(answer, ask="which model answered?"):
+    return [
+        {"role": "user", "content": "What is a DAG?"},
+        {"role": "assistant", "content": answer},
+        {"role": "user", "content": ask},
+    ]
+
+
+def test_follow_up_returns_the_stored_trace_with_no_model_call(monkeypatch, auth):
+    sent = _record(monkeypatch, answer="A directed acyclic graph.")
+    with _client(monkeypatch) as client:
+        first = _ask(client, [{"role": "user", "content": "What is a DAG?"}], auth)
+        assert "Model trace" not in _text(first)
+        monkeypatch.setattr("jarvis.gateway.chat", _refuse)
+        monkeypatch.setattr("jarvis.gateway.classify", _refuse)
+        again = _ask(client, _followup(_text(first)), auth, model="jarvis")
+    assert len(sent) == 1
+    assert again.status_code == 200
+    assert "Labels from: `explicit model`" in _text(again)
+    assert "Deployment: `general-small-mini`" in _text(again)
+
+
+def test_follow_up_is_served_as_a_stream_when_the_client_streams(monkeypatch, auth):
+    _record(monkeypatch, answer="A directed acyclic graph.")
+    with _client(monkeypatch) as client:
+        first = _ask(client, [{"role": "user", "content": "What is a DAG?"}], auth)
+        monkeypatch.setattr("jarvis.gateway.chat", _refuse)
+        again = _ask(client, _followup(_text(first), "show trace"), auth, stream=True)
+    assert "Labels from:" in "".join(_sse_contents(again))
+
+
+def test_same_phrase_with_no_stored_trace_is_a_normal_question(monkeypatch, auth):
+    sent = _record(monkeypatch, answer="I am a model.")
+    with _client(monkeypatch) as client:
+        response = _ask(client, _followup("Something Jarvis never said"), auth)
+    assert [m for m, _ in sent] == ["general-small-mini"]
+    assert sent[-1][1][-1] == {"role": "user", "content": "which model answered?"}
+    assert _text(response) == "I am a model."
+
+
+def test_which_model_should_i_use_is_a_normal_question_with_no_trace(monkeypatch, auth):
+    _record(monkeypatch, answer="Use nomic-embed-text.")
+    ask = [{"role": "user", "content": "which model should I use for embeddings?"}]
+    with _client(monkeypatch) as client:
+        response = _ask(client, ask, auth)
+    assert _text(response) == "Use nomic-embed-text."
+
+
+# ── trace on the current answer ───────────────────────────────────────────────
+@pytest.mark.parametrize(("model", "extra"), [("jarvis-trace", None), ("general", TRACE_ON)])
+def test_trace_is_appended_to_a_non_streamed_answer(monkeypatch, auth, model, extra):
+    _record(monkeypatch)
+    with _client(monkeypatch) as client:
+        response = _ask(client, [{"role": "user", "content": "hi"}], auth, model, extra=extra)
+    text = _text(response)
+    assert text.startswith("the answer" + TRACE_MARK)
+    assert "Labels from:" in text
+
+
+def test_the_old_keyword_triggers_are_gone(monkeypatch, auth):
+    assert not hasattr(gateway, "TRACE_TRIGGERS")
+    _record(monkeypatch)
+    with _client(monkeypatch) as client:
+        response = _ask(client, [{"role": "user", "content": "why did you pick that?"}], auth)
+    assert "Model trace" not in _text(response)
+
+
+# ── failures store nothing ────────────────────────────────────────────────────
+def test_a_failed_answer_stores_no_trace(monkeypatch, auth):
+    def broken(*_a, **_k):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr("jarvis.gateway.chat", broken)
+    with _client(monkeypatch) as client:
+        response = _ask(client, [{"role": "user", "content": "hi"}], auth, extra=TRACE_ON)
+    assert response.status_code == 502
+    assert len(gateway.TRACES) == 0
 
 
 # ── block trimming with trace appendices in the replay ────────────────────────

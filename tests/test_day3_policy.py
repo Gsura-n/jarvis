@@ -129,6 +129,9 @@ def _post(client, content, model="jarvis", headers=None):
     )
 
 
+TRACE_HEADERS = {"X-Jarvis-Trace": "1"}
+
+
 def _refuse(*_args, **_kwargs):
     raise AssertionError("this call should not happen")
 
@@ -147,7 +150,9 @@ def test_reasoning_trace_names_the_laptop_when_it_is_online(monkeypatch, auth_he
     monkeypatch.setattr("jarvis.gateway.chat", lambda *_a, **_k: "done")
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     with _client(monkeypatch) as client:
-        response = _post(client, "which model answered that?", model="reasoning", headers=auth_headers)
+        response = _post(
+            client, "which model answered that?", model="reasoning", headers=TRACE_HEADERS | auth_headers
+        )
     text = response.json()["choices"][0]["message"]["content"]
     assert "Device: `macbook-pro`" in text
     assert "Deployment: `reasoning-large-mbp`" in text
@@ -158,7 +163,9 @@ def test_offline_laptop_answers_from_the_mini(monkeypatch, auth_headers):
     monkeypatch.setattr("jarvis.gateway.chat", lambda model, *_a, **_k: f"from {model}")
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     with _client(monkeypatch, offline=True) as client:
-        response = _post(client, "which model answered that?", model="reasoning", headers=auth_headers)
+        response = _post(
+            client, "which model answered that?", model="reasoning", headers=TRACE_HEADERS | auth_headers
+        )
     text = response.json()["choices"][0]["message"]["content"]
     assert "from reasoning-large-mini" in text
     assert "Device: `mini`" in text
