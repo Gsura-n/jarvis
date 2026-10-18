@@ -35,7 +35,7 @@ from jarvis.budget import (
 from jarvis.classify import classify
 from jarvis.config import cors_origins, jarvis_api_key, settings
 from jarvis.gateway_metrics import StepTimer
-from jarvis.messages import text_of
+from jarvis.messages import clean_assistant, text_of
 from jarvis.policy import Decision, decide, prefer_decomposer, walk_tier
 from jarvis.registry import Registry, bind_snapshot, current_snapshot, mini_only, reset_snapshot, set_registry
 from jarvis.task_decomposer import decompose_and_execute
@@ -267,11 +267,14 @@ def prior_turns(messages: list, user_msg: str) -> list[dict]:
             last = index
     if last is None:
         return []
-    return [
-        {"role": message["role"], "content": text_of(message.get("content"))}
-        for message in messages[:last]
-        if message.get("role") in ("user", "assistant")
-    ]
+    turns = []
+    for message in messages[:last]:
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = text_of(message.get("content"))
+        turns.append({"role": role, "content": clean_assistant(text) if role == "assistant" else text})
+    return turns
 
 
 def budgeted_messages(
