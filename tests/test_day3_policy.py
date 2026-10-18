@@ -193,11 +193,11 @@ def test_degraded_design_and_build_uses_the_decomposer(monkeypatch, auth_headers
     assert "Decomposed into 1 subtasks" in text
 
 
-def test_model_list_includes_trace_and_decompose(monkeypatch, auth_headers):
+def test_model_list_starts_with_jarvis_and_includes_trace_and_decompose(monkeypatch, auth_headers):
     with _client(monkeypatch) as client:
-        names = {item["id"] for item in client.get("/v1/models", headers=auth_headers).json()["data"]}
-    assert "jarvis-trace" in names
-    assert "jarvis-decompose" in names
+        ids = [item["id"] for item in client.get("/v1/models", headers=auth_headers).json()["data"]]
+    assert ids[0] == "jarvis"
+    assert {"general", "coding", "reasoning", "jarvis-trace", "jarvis-decompose"} <= set(ids)
 
 
 def test_parallel_subtasks_keep_the_mini_only_snapshot(monkeypatch):
