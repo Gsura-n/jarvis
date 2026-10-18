@@ -177,17 +177,26 @@ def rag_query(question: str, top_k: int = 4) -> str:
 
 
 # ── LiteLLM helpers ───────────────────────────────────────────────────────────
+def _retryable(e: Exception) -> bool:
+    """Connection errors and 5xx may work next time. A 4xx will fail the same way."""
+    if isinstance(e, requests.HTTPError):
+        return e.response is not None and e.response.status_code >= 500
+    return isinstance(e, requests.ConnectionError)
+
+
 def chat(
     model_alias: str,
     messages: list,
     temperature: float = 0.3,
     max_tokens: int | None = None,
-    _retry: bool = True,
+    retry: bool = True,
+    timeout: float = 600,
     **params,
 ) -> str:
-    """Non-streaming chat — returns full response string. Retries once on failure.
+    """Non-streaming chat — returns full response string.
 
-    Extra params (for example response_format) go to LiteLLM as given."""
+    Retries once on a connection error or 5xx, never on 4xx. Extra params (for example
+    response_format) go to LiteLLM as given."""
     payload = {"model": model_alias, "messages": messages, "temperature": temperature, **params}
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
@@ -196,16 +205,51 @@ def chat(
             f"{LITELLM_BASE}/chat/completions",
             headers={"Authorization": f"Bearer {LITELLM_KEY}"},
             json=payload,
-            timeout=600,
+            timeout=timeout,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        if _retry:
+        if retry and _retryable(e):
             print(f"[chat] {model_alias} failed ({e}) — retrying once...")
             time.sleep(2)
-            return chat(model_alias, messages, temperature, max_tokens, _retry=False, **params)
+            return chat(
+                model_alias, messages, temperature, max_tokens, retry=False, timeout=timeout, **params
+            )
         raise
+
+
+REASON_CHARS = 300
+
+
+def short_reason(text: str) -> str:
+    """One line, at most REASON_CHARS, with the LiteLLM key masked."""
+    text = " ".join(str(text).split())
+    if LITELLM_KEY:
+        text = text.replace(LITELLM_KEY, "***")
+    return text[:REASON_CHARS]
+
+
+def _status_reason(status: int, body: str) -> str:
+    """HTTP status plus the upstream error message. Never headers or the request."""
+    try:
+        err = json.loads(body).get("error")
+        body = str(err.get("message") if isinstance(err, dict) else err or body)
+    except Exception:
+        pass
+    return short_reason(f"HTTP {status}: {body}")
+
+
+def describe_error(e: Exception) -> str:
+    """A short reason for a failed upstream call."""
+    response = getattr(e, "response", None)
+    if isinstance(e, requests.HTTPError) and response is not None:
+        return _status_reason(response.status_code, response.text)
+    if isinstance(e, (requests.Timeout, httpx.TimeoutException)):
+        return "timed out"
+    if isinstance(e, (requests.ConnectionError, httpx.TransportError)):
+        return "could not reach the model server"
+    return short_reason(f"{type(e).__name__}")
 
 
 def _stream_client() -> httpx.AsyncClient:
@@ -220,7 +264,8 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
     before the device semaphore is released. CancelledError is not caught.
 
     Thinking (reasoning_content) is yielded inside a <think> block that closes before
-    the first answer token, or at the end of the stream.
+    the first answer token. An upstream or transport error ends the stream with one
+    "[Jarvis] <deployment>: <reason>" token.
     """
     payload = {
         "model": deployment,
@@ -231,6 +276,7 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
     }
     skipped = 0
     thinking = False
+    failure = None
     try:
         async with device_semaphore(device):
             async with _stream_client() as client:
@@ -240,38 +286,45 @@ async def stream_tokens(deployment: str, device: str, messages: list, max_tokens
                     json=payload,
                     headers={"Authorization": f"Bearer {LITELLM_KEY}"},
                 ) as response:
-                    response.raise_for_status()
-                    try:
-                        async for line in response.aiter_lines():
-                            if not line or not line.startswith("data: ") or line == "data: [DONE]":
-                                continue
-                            try:
-                                chunk = json.loads(line[6:])
-                                delta = chunk["choices"][0]["delta"]
-                                thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                                text = delta.get("content") or ""
-                            except Exception:
-                                skipped += 1
-                                continue
-                            if thought:
-                                if not thinking:
-                                    thinking = True
-                                    yield "<think>\n"
-                                yield thought
-                            if text:
-                                if thinking:
-                                    thinking = False
-                                    yield "\n</think>\n\n"
-                                yield text
-                    finally:
-                        if skipped:
-                            log.warning(
-                                "skipped %s unreadable stream lines deployment=%s", skipped, deployment
-                            )
+                    if response.status_code != 200:
+                        body = (await response.aread()).decode("utf-8", "replace")
+                        failure = _status_reason(response.status_code, body)
+                    else:
+                        try:
+                            async for line in response.aiter_lines():
+                                if not line or not line.startswith("data: ") or line == "data: [DONE]":
+                                    continue
+                                try:
+                                    delta = json.loads(line[6:])["choices"][0]["delta"]
+                                    thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                                    text = delta.get("content") or ""
+                                except Exception:
+                                    skipped += 1
+                                    continue
+                                if thought:
+                                    if not thinking:
+                                        thinking = True
+                                        yield "<think>\n"
+                                    yield thought
+                                if text:
+                                    if thinking:
+                                        thinking = False
+                                        yield "\n</think>\n\n"
+                                    yield text
+                        finally:
+                            if skipped:
+                                log.warning(
+                                    "skipped %s unreadable stream lines deployment=%s", skipped, deployment
+                                )
+    except httpx.HTTPError as e:
+        failure = describe_error(e)
     except Exception:
         log.exception("stream worker failed deployment=%s", deployment)
     if thinking:
         yield "\n</think>\n\n"
+    if failure:
+        log.warning("upstream error deployment=%s reason=%s", deployment, failure)
+        yield f"\n\n[Jarvis] {deployment}: {failure}"
 
 
 # ── Step 1 — History ──────────────────────────────────────────────────────────
@@ -525,10 +578,15 @@ async def completions(request: Request):
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
     if decision.deployment != "decomposer":
-        async with device_semaphore(decision.device):
-            answer, models_used = await asyncio.to_thread(
-                execute, intent, user_msg, rag_context, tracker, history, decision
-            )
+        try:
+            async with device_semaphore(decision.device):
+                answer, models_used = await asyncio.to_thread(
+                    execute, intent, user_msg, rag_context, tracker, history, decision
+                )
+        except Exception as e:
+            reason = describe_error(e)
+            log.warning("answer call failed deployment=%s reason=%s", decision.deployment, reason)
+            return JSONResponse({"error": {"message": f"{decision.deployment}: {reason}"}}, status_code=502)
 
     if wants_trace:
         trace = (
