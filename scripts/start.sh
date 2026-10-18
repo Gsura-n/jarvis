@@ -10,6 +10,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing $ENV_FILE. Copy .env.example there and fill it in."; exit 1
 fi
 set -a; source "$ENV_FILE"; set +a
+: "${JARVIS_API_KEY:?JARVIS_API_KEY must be set in $ENV_FILE (generate one with: openssl rand -hex 32)}"
 : "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in $ENV_FILE}"
 : "${DATABASE_URL:?DATABASE_URL must be set in $ENV_FILE}"
 
