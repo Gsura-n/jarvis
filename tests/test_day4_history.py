@@ -183,12 +183,40 @@ def test_trace_is_appended_to_a_non_streamed_answer(monkeypatch, auth, model, ex
     assert "Labels from:" in text
 
 
+@pytest.mark.parametrize(("model", "extra"), [("jarvis-trace", None), ("general", TRACE_ON)])
+def test_trace_is_the_last_chunk_of_a_streamed_answer(monkeypatch, auth, model, extra):
+    _mock_stream(monkeypatch, _upstream({"content": "hel"}, {"content": "lo"}))
+    with _client(monkeypatch) as client:
+        response = _ask(client, [{"role": "user", "content": "hi"}], auth, model, True, extra)
+    chunks = _sse_contents(response)
+    assert "".join(chunks[:-1]) == "hello"
+    assert chunks[-1].startswith(TRACE_MARK) and "Labels from:" in chunks[-1]
+    assert "llm_stream" in chunks[-1]  # built after the stream ended, so the timing is there
+
+
+def test_no_trace_unless_asked(monkeypatch, auth):
+    _mock_stream(monkeypatch, _upstream({"content": "hello"}))
+    with _client(monkeypatch) as client:
+        response = _ask(client, [{"role": "user", "content": "which model answered?"}], auth, "general", True)
+    assert _sse_contents(response) == ["hello"]
+
+
 def test_the_old_keyword_triggers_are_gone(monkeypatch, auth):
     assert not hasattr(gateway, "TRACE_TRIGGERS")
     _record(monkeypatch)
     with _client(monkeypatch) as client:
         response = _ask(client, [{"role": "user", "content": "why did you pick that?"}], auth)
     assert "Model trace" not in _text(response)
+
+
+def test_a_streamed_answer_is_stored_for_a_later_follow_up(monkeypatch, auth):
+    _mock_stream(monkeypatch, _upstream({"reasoning_content": "hmm"}, {"content": "hello"}))
+    with _client(monkeypatch) as client:
+        first = _ask(client, [{"role": "user", "content": "hi"}], auth, "general", True)
+        answer = "".join(_sse_contents(first))
+        monkeypatch.setattr("jarvis.gateway.chat", _refuse)
+        again = _ask(client, _followup(answer), auth)
+    assert "Labels from: `explicit model`" in _text(again)
 
 
 # ── failures store nothing ────────────────────────────────────────────────────
@@ -200,6 +228,16 @@ def test_a_failed_answer_stores_no_trace(monkeypatch, auth):
     with _client(monkeypatch) as client:
         response = _ask(client, [{"role": "user", "content": "hi"}], auth, extra=TRACE_ON)
     assert response.status_code == 502
+    assert len(gateway.TRACES) == 0
+
+
+def test_a_failed_stream_stores_and_sends_no_trace(monkeypatch, auth):
+    _mock_stream(monkeypatch, _upstream(status=500))
+    with _client(monkeypatch) as client:
+        response = _ask(client, [{"role": "user", "content": "hi"}], auth, "general", True, TRACE_ON)
+    chunks = _sse_contents(response)
+    assert any("[Jarvis]" in c for c in chunks)
+    assert not any("Model trace" in c for c in chunks)
     assert len(gateway.TRACES) == 0
 
 
@@ -245,3 +283,17 @@ def test_assemble_messages_is_untouched_by_the_appendix():
         [clean[0], {"role": "assistant", "content": "a" + APPENDIX}, {"role": "user", "content": "q2"}], "q2"
     )
     assert assemble_messages(history=traced, **common) == assemble_messages(history=clean, **common)
+
+
+def test_show_trace_twice_in_a_row_returns_the_same_trace(monkeypatch, auth):
+    _record(monkeypatch, answer="A directed acyclic graph.")
+    with _client(monkeypatch) as client:
+        first = _ask(client, [{"role": "user", "content": "What is a DAG?"}], auth)
+        monkeypatch.setattr("jarvis.gateway.chat", _refuse)
+        monkeypatch.setattr("jarvis.gateway.classify", _refuse)
+        convo = _followup(_text(first), "show trace")
+        second = _ask(client, convo, auth, model="jarvis")
+        convo += [{"role": "assistant", "content": _text(second)}, {"role": "user", "content": "show trace"}]
+        third = _ask(client, convo, auth, model="jarvis")
+    assert "Labels from:" in _text(second)
+    assert _text(third) == _text(second)

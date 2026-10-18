@@ -194,3 +194,25 @@ def test_followup_looks_at_the_answer_before_the_latest_question_only():
         {"role": "user", "content": "show trace"},
     ]
     assert trace_followup(messages, store) is None
+
+
+def test_asking_twice_in_a_row_returns_the_same_trace():
+    store = TraceStore()
+    store.put("A directed acyclic graph.", TRACE)
+    messages = _convo("show trace") + [
+        {"role": "assistant", "content": TRACE.strip()},
+        {"role": "user", "content": "show trace"},
+    ]
+    assert trace_followup(messages, store) == TRACE
+    messages += [{"role": "assistant", "content": TRACE.strip()}, {"role": "user", "content": "model trace"}]
+    assert trace_followup(messages, store) == TRACE
+
+
+def test_a_returned_trace_alone_is_not_an_answer_to_look_up():
+    store = TraceStore()
+    store.put("A directed acyclic graph.", TRACE)
+    messages = [
+        {"role": "assistant", "content": TRACE.strip()},
+        {"role": "user", "content": "show trace"},
+    ]
+    assert trace_followup(messages, store) is None
