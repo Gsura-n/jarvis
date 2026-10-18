@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
+import requests
+
 from jarvis.messages import text_of
 
 INTENTS = ("general", "code", "reasoning", "code+reasoning")
@@ -50,6 +52,8 @@ Reply with JSON only: {"intent": ..., "complexity": ..., "needs_rag": ...}"""
 
 TURNS = 6  # messages of history shown to the classifier
 TURN_CHARS = 400  # earlier turns are clipped to this; the latest request is clipped to 2000
+
+CLASSIFY_TIMEOUT = 15  # seconds; a hung 3B model must not hold a request
 
 Complete = Callable[..., str]
 
@@ -102,7 +106,11 @@ def classify(messages: list[dict], complete: Complete, alias: str = "classify-mi
             temperature=0,
             max_tokens=40,
             response_format={"type": "json_schema", "json_schema": {"name": "route", "schema": SCHEMA}},
+            timeout=CLASSIFY_TIMEOUT,
+            retry=False,
         )
+    except requests.Timeout:
+        return dict(DEFAULT), "fallback: classifier timeout"
     except Exception as e:
         return dict(DEFAULT), f"fallback: {e}"
     labels = parse_labels(raw)
