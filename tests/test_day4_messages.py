@@ -85,6 +85,11 @@ def test_earlier_list_turns_reach_the_model_as_text(monkeypatch, auth_headers): 
         ("<thinking>plan</thinking>The answer.", "The answer."),
         ("No thinking here.", "No thinking here."),
         ("", ""),
+        ("<think>\nstopped while thinking", ""),
+        ("  <thinking>stopped while thinking", ""),
+        ("<think>done</think><think>then stopped", ""),
+        ("Use the <think> tag for reasoning.", "Use the <think> tag for reasoning."),
+        ("Answer first. <think> unfinished", "Answer first. <think> unfinished"),
         ('<details type="other">keep</details>', '<details type="other">keep</details>'),
     ],
 )
@@ -116,3 +121,28 @@ def test_think_blocks_do_not_reach_the_model_on_the_next_turn(monkeypatch, auth_
         assert client.post("/v1/chat/completions", json=body, headers=auth_headers).status_code == 200
     assistants = [m["content"] for m in sent[0] if m["role"] == "assistant"]
     assert assistants == ["first answer", "second answer"]
+
+
+def test_a_turn_stopped_mid_thinking_reaches_the_model_as_nothing(monkeypatch, auth_headers):  # noqa: F811
+    sent = []
+
+    def fake_chat(model, messages, *_a, **_k):
+        sent.append(messages)
+        return "fine"
+
+    monkeypatch.setattr("jarvis.gateway.chat", fake_chat)
+    monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
+    body = {
+        "model": "general",
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "<think>\nI was about to"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "Use the <think> tag."},
+            {"role": "user", "content": "third"},
+        ],
+    }
+    with _client(monkeypatch) as client:
+        assert client.post("/v1/chat/completions", json=body, headers=auth_headers).status_code == 200
+    history = [(m["role"], m["content"]) for m in sent[0] if m["role"] != "system"][:-1]
+    assert history == [("user", "first"), ("user", "second"), ("assistant", "Use the <think> tag.")]

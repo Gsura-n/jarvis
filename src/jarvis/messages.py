@@ -18,10 +18,14 @@ def text_of(content) -> str:
 
 # Thinking the gateway streams as <think>, or that Open WebUI stores as a reasoning <details> block.
 _THINK = re.compile(r"<(think|thinking)>.*?</\1>", re.DOTALL)
+_UNCLOSED_THINK = re.compile(r"\s*<(think|thinking)>")
 _REASONING_DETAILS = re.compile(r'<details\s+type="reasoning"[^>]*>.*?</details>', re.DOTALL)
 
 
 def clean_assistant(text: str) -> str:
-    """An assistant turn as the model should see it next time: without its thinking."""
-    text = _REASONING_DETAILS.sub("", _THINK.sub("", text))
-    return text.strip()
+    """An assistant turn as the model should see it next time: without its thinking.
+
+    A turn that still starts with an unclosed <think> was stopped mid-thinking, so none of
+    it is an answer. A <think> later in normal text is left alone."""
+    text = _REASONING_DETAILS.sub("", _THINK.sub("", text)).strip()
+    return "" if _UNCLOSED_THINK.match(text) else text
