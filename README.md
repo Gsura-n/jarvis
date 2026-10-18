@@ -53,7 +53,7 @@ cp .env.example ~/.jarvis.env    # then fill in every value
 ./scripts/stop.sh
 ```
 
-Point any OpenAI compatible client at `http://localhost:4001/v1`. Open WebUI and Continue must send the value of `JARVIS_API_KEY` as the API key for the Jarvis connection. Every route except `GET /health` rejects a missing or wrong key. To get the routing and timing trace appended to an answer, pick the `jarvis-trace` model or send the header `X-Jarvis-Trace: 1`; for now a trace request is answered in one piece even if the client asked for a stream. Asking "which model answered?" or "show trace" (a short message that starts or ends with that phrase) right after an answer returns that answer's trace without calling a model.
+Point any OpenAI compatible client at `http://localhost:4001/v1`. Open WebUI and Continue must send the value of `JARVIS_API_KEY` as the API key for the Jarvis connection. Every route except `GET /health` rejects a missing or wrong key. To get the routing and timing trace appended to an answer, pick the `jarvis-trace` model or send the header `X-Jarvis-Trace: 1`; streamed answers get it as the last chunk. Asking "which model answered?" or "show trace" (a short message that starts or ends with that phrase) right after an answer returns that answer's trace without calling a model.
 
 Logs and traces land in `.logs/` (gitignored). Topology, tiers and budgets are in `jarvis.yaml`; secrets are only ever in `~/.jarvis.env`.
 
