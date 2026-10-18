@@ -134,7 +134,7 @@ def _refuse(*_args, **_kwargs):
 
 
 def test_explicit_coding_skips_the_classifier(monkeypatch, auth_headers):
-    monkeypatch.setattr("jarvis.gateway.enhance_and_classify", _refuse)
+    monkeypatch.setattr("jarvis.gateway.classify", _refuse)
     monkeypatch.setattr("jarvis.gateway.chat", lambda model, *_a, **_k: f"from {model}")
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     with _client(monkeypatch) as client:
@@ -168,8 +168,11 @@ def test_offline_laptop_answers_from_the_mini(monkeypatch, auth_headers):
 def test_degraded_design_and_build_uses_the_decomposer(monkeypatch, auth_headers):
     monkeypatch.setattr("jarvis.gateway.rag_query", lambda *_a, **_k: "")
     monkeypatch.setattr(
-        "jarvis.gateway.enhance_and_classify",
-        lambda *_a, **_k: {"enhanced_prompt": "build it", "intent": "code+reasoning", "needs_rag": False},
+        "jarvis.gateway.classify",
+        lambda *_a, **_k: (
+            {"intent": "code+reasoning", "complexity": "complex", "needs_rag": False},
+            "classifier",
+        ),
     )
     monkeypatch.setattr(
         "jarvis.gateway.decompose_and_execute",
