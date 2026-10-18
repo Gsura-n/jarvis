@@ -1,6 +1,6 @@
 # ADR 0008: Classifier returns labels only; explicit model choice skips it
 
-**Status:** Proposed
+**Status:** Accepted (implemented 2026-09-23)
 **Date:** 2026-09-23
 **Deciders:** Gauttam
 
@@ -46,6 +46,12 @@ B fixes the known bugs with the least new code. C could remove the LLM from the 
 
 ## Action Items
 
-1. [ ] `classify.py` with a JSON schema and last N turns.
-2. [ ] Honor `body["model"]` in the gateway.
-3. [ ] Remove `ENHANCE_SYSTEM` rewrite logic and keyword fallback.
+1. [x] `classify.py` with a JSON schema and last N turns.
+2. [x] Honor `body["model"]` in the gateway.
+3. [x] Remove `ENHANCE_SYSTEM` rewrite logic and keyword fallback.
+
+## Implementation notes
+
+- Trace follow ups use a short list of explicit phrases ("which model answered", "show trace") and only fire when the gateway still holds a trace for the previous answer, keyed by a hash of its text. Anything else is treated as a normal question. `jarvis-trace` and the `X-Jarvis-Trace: 1` header append the trace to the current answer.
+- The RAG keyword list stays, but only to start retrieval early. It no longer decides the intent.
+- A classifier reply that fails validation falls back to `general` with no RAG, and the trace says so.

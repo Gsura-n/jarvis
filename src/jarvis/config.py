@@ -53,6 +53,9 @@ class Settings:
     neo4j_user: str
     neo4j_password: str
 
+    # Gateway API key: clients send it as a bearer token
+    api_key: str
+
     # Ollama on this machine (embeddings, health)
     ollama_base: str
     embed_model: str
@@ -70,6 +73,7 @@ class Settings:
 
     def missing_required(self) -> list[str]:
         required = {
+            "JARVIS_API_KEY": self.api_key,
             "LITELLM_MASTER_KEY": self.litellm_key,
             "NEO4J_URI": self.neo4j_uri,
             "NEO4J_USER": self.neo4j_user,
@@ -100,6 +104,7 @@ def load_settings() -> Settings:
         neo4j_uri=os.getenv("NEO4J_URI", ""),
         neo4j_user=os.getenv("NEO4J_USER", ""),
         neo4j_password=os.getenv("NEO4J_PASSWORD", ""),
+        api_key=os.getenv("JARVIS_API_KEY", ""),
         ollama_base=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         embed_model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
         log_dir=log_dir,

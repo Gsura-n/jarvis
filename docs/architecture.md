@@ -70,7 +70,7 @@ Open WebUI / Continue / curl
 
 1. Authenticate and assign a request ID. Reject if no API key.
 2. Normalize the conversation. Keep the last N turns (token budgeted), not only the last user message. This fixes the "show trace" follow up bug and gives multi turn context.
-3. Classify with structured output. The classifier returns intent, complexity (small or large), needs_rag, enhanced_prompt, as a JSON schema enforced by Ollama's format parameter. Parse failures become impossible rather than handled.
+3. Classify with structured output. The classifier returns labels only (intent, complexity, needs_rag; see ADR 0008), as a JSON schema enforced by Ollama's format parameter, and the user's own messages go downstream unchanged. Parse failures become impossible rather than handled.
 4. Retrieve RAG context if needed, budgeted to a fixed token allowance.
 5. Policy decides a deployment: tier from intent and complexity, then the best online device for that tier from the registry. If the preferred device is offline, degrade to the mini's fallback for that tier and mark the response as degraded in the trace.
 6. Execute. Simple intents stream straight through. Complex code+reasoning goes through the decomposer, whose subtasks are scheduled across devices: one heavy subtask per device at a time, so two subtasks can run in parallel only when they land on different machines.

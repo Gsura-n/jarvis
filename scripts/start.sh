@@ -12,6 +12,7 @@ fi
 set -a; source "$ENV_FILE"; set +a
 : "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in $ENV_FILE}"
 : "${DATABASE_URL:?DATABASE_URL must be set in $ENV_FILE}"
+: "${JARVIS_API_KEY:?JARVIS_API_KEY must be set in $ENV_FILE (openssl rand -hex 32)}"
 
 cd "$REPO"
 echo "Starting Jarvis from $REPO"

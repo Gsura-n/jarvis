@@ -11,7 +11,7 @@ Open WebUI / Continue / curl
             |
             v
    +-------------------+
-   |  Jarvis Gateway   |  :4001  enhance -> classify -> RAG -> route -> execute -> validate
+   |  Jarvis Gateway   |  :4001  auth -> classify -> RAG -> route -> execute -> validate
    |  (FastAPI, mini)  |
    +-------------------+
      |      |       |
@@ -53,7 +53,22 @@ cp .env.example ~/.jarvis.env    # then fill in every value
 ./scripts/stop.sh
 ```
 
-Point any OpenAI compatible client at `http://localhost:4001/v1`. Ask "which model answered?" or "show trace" at the end of a question to get the routing and timing trace appended to the answer.
+Point any OpenAI compatible client at `http://localhost:4001/v1` with `JARVIS_API_KEY` as the API key (a bearer token). Every `/v1` route requires it; `/health` does not.
+
+```bash
+curl -s http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $JARVIS_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "jarvis", "messages": [{"role": "user", "content": "What is a DAG?"}]}'
+```
+
+| `model` | What happens |
+|---|---|
+| `jarvis` | the classifier picks the route |
+| `jarvis-trace` | same, with the routing and timing trace appended |
+| `general`, `coding`, `reasoning` | that route directly, no classifier call |
+| `jarvis-decompose` | the task decomposer directly |
+
+After any answer, ask "which model answered?" or "show trace" to get that answer's trace without another model call.
 
 Logs and traces land in `.logs/` (gitignored). Topology, tiers and budgets are in `jarvis.yaml`; secrets are only ever in `~/.jarvis.env`.
 
@@ -64,7 +79,7 @@ src/jarvis/          the package (gateway, decomposer, tracer, RAG watcher, conf
 configs/litellm.yaml LiteLLM deployments; secrets referenced as os.environ/NAME
 jarvis.yaml          devices, tiers, budgets, guard thresholds
 scripts/             start.sh, stop.sh
-tests/               pure function tests (no models, no network, no secrets)
+tests/               pure function and gateway tests (models mocked; no network, no secrets)
 evals/               golden set and runner (week 2)
 docs/architecture.md the design, kept current
 docs/adr/            one file per decision

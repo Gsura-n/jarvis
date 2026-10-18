@@ -11,6 +11,11 @@ rag:
     - name: portfolio-showcase-platform
       path: ~/projects/portfolio-showcase-platform
 
+gateway:
+  host: 0.0.0.0          # reachable on the LAN; every /v1 call needs JARVIS_API_KEY
+  port: 4001
+  cors_origins: []       # Open WebUI and Continue call from their own processes, so none are needed
+
 devices:
   mini:
     role: control-plane

@@ -1,62 +1,89 @@
 """
-Smart Gateway — port 4001
-OpenAI-compatible API that orchestrates:
-  1. Prompt enhancement
-  2. Intent classification
-  3. RAG context (project-aware)
-  4. Model routing + chaining
-  5. Streaming responses
-  6. Model trace on demand with timing + memory
+Jarvis gateway, port 4001. OpenAI compatible.
+
+Request path:
+  1. API key check (every /v1 route except the two probe endpoints)
+  2. Intent: taken from the `model` field when it names a tier, otherwise
+     from the labels only classifier, which sees the last few turns (ADR 0008)
+  3. RAG when the intent or classifier asks for it (runs in a worker thread)
+  4. One model call with the real conversation, streamed when asked, or the
+     task decomposer for design and build requests
+  5. The routing trace is kept in memory, so "which model answered?" as a
+     follow up returns the trace of the previous answer without a model call
+
+Everything here is async. Blocking work (Neo4j, the decomposer) runs in
+worker threads, so one long answer no longer freezes /health or other requests.
 """
 
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
 import json
+import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 
 import requests
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from neo4j import GraphDatabase
 
+from jarvis import classify, llm
+from jarvis.classify import text_of
 from jarvis.config import settings
 from jarvis.gateway_metrics import StepTimer
 from jarvis.task_decomposer import decompose_and_execute
 
-# ── Config — everything comes from jarvis.config (env file + jarvis.yaml) ─────
-LITELLM_BASE = settings.litellm_base
-LITELLM_KEY = settings.litellm_key
-NEO4J_URI = settings.neo4j_uri
-NEO4J_USER = settings.neo4j_user
-NEO4J_PASSWORD = settings.neo4j_password
-OLLAMA_BASE = settings.ollama_base
-EMBED_MODEL = settings.embed_model
+# ── Config: everything comes from jarvis.config (env file + jarvis.yaml) ─────
+GATEWAY = settings.topology.get("gateway", {})
+BUDGETS = settings.topology.get("budgets", {})
+API_KEY = settings.api_key
+HISTORY_CHARS = int(BUDGETS.get("tokens", {}).get("history", 2000)) * 4  # about 4 chars per token
 
-# Validate required credentials at startup
 _missing = settings.missing_required()
 if _missing:
     print(f"⚠️  Missing required env vars: {', '.join(_missing)}")
     print(f"   Add them to {settings.env_file}")
 
-MODELS = {
-    "general": "general",
-    "code": "coding",
-    "reasoning": "reasoning",
+# intent -> (LiteLLM alias, name shown in traces, extra system instruction).
+# Day 3 replaces this table with policy.py reading the tiers in jarvis.yaml.
+ROUTES = {
+    "general": ("general", "general (llama3.1:8b)", ""),
+    "code": ("coding", "coding (qwen2.5-coder:7b)", "Write clean, production-ready code with comments."),
+    "reasoning": ("reasoning", "reasoning (deepseek-r1:8b)", "Think step by step. Be thorough."),
 }
 
-TRACE_TRIGGERS = [
-    "which model",
-    "what model",
-    "why did you",
-    "how did you",
-    "explain your process",
-    "show trace",
-    "model trace",
-    "who answered",
-]
+# `model` values that force an intent and skip the classifier.
+EXPLICIT_MODELS = {
+    "general": "general",
+    "coding": "code",
+    "reasoning": "reasoning",
+    "jarvis-decompose": "code+reasoning",
+}
+# Anything else ("jarvis", "jarvis-trace", unknown names) is auto routed.
+MODEL_IDS = ["jarvis", "jarvis-trace", "jarvis-decompose", "general", "coding", "reasoning"]
 
-RAG_TRIGGERS = [
+# Phrases that ask how the PREVIOUS answer was produced. Kept narrow on purpose:
+# "why did you pick Postgres?" is a real question, not a trace request.
+TRACE_FOLLOWUPS = (
+    "show trace",
+    "show the trace",
+    "model trace",
+    "which model answered",
+    "what model answered",
+    "which model did you use",
+    "what model did you use",
+    "which model was used",
+    "who answered",
+)
+
+# Start RAG before classification finishes when the message obviously needs it.
+RAG_TRIGGERS = (
     "my project",
     "my code",
     "my repo",
@@ -73,16 +100,45 @@ RAG_TRIGGERS = [
     "agent page",
     "dashboard",
     "component",
-]
-
-app = FastAPI(title="Jarvis Smart Gateway")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
-# ── Neo4j ─────────────────────────────────────────────────────────────────────
+TRACE_MARK = "\n\n---\n**Model trace:**"
+THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    await llm.aclose()
+
+
+app = FastAPI(title="Jarvis Gateway", lifespan=lifespan)
+
+# Open WebUI and Continue call the gateway from their own processes, not from a
+# browser page, so they need no CORS at all. Only list origins that really need it.
+_origins = GATEWAY.get("cors_origins") or []
+if _origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+
+def require_api_key(request: Request) -> None:
+    if not API_KEY:
+        raise HTTPException(503, "JARVIS_API_KEY is not set on the gateway")
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not token or not hmac.compare_digest(token.encode(), API_KEY.encode()):
+        raise HTTPException(401, "Invalid or missing API key", headers={"WWW-Authenticate": "Bearer"})
+
+
+# ── RAG (sync Neo4j driver, always called through asyncio.to_thread) ──────────
 try:
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
 except Exception:
     driver = None
 
@@ -90,8 +146,8 @@ except Exception:
 def get_embedding(text: str) -> list:
     try:
         r = requests.post(
-            f"{OLLAMA_BASE}/api/embed",
-            json={"model": EMBED_MODEL, "input": text[:2000]},
+            f"{settings.ollama_base}/api/embed",
+            json={"model": settings.embed_model, "input": text[:2000]},
             timeout=15,
         )
         return r.json().get("embeddings", [[]])[0]
@@ -130,415 +186,305 @@ def rag_query(question: str, top_k: int = 4) -> str:
         return ""
 
 
-# ── LiteLLM helpers ───────────────────────────────────────────────────────────
-def chat(model_alias: str, messages: list, temperature: float = 0.3, _retry: bool = True) -> str:
-    """Non-streaming chat — returns full response string. Retries once on failure."""
-    try:
-        r = requests.post(
-            f"{LITELLM_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-            json={"model": model_alias, "messages": messages, "temperature": temperature},
-            timeout=600,
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        if _retry:
-            print(f"[chat] {model_alias} failed ({e}) — retrying once...")
-            time.sleep(2)
-            return chat(model_alias, messages, temperature, _retry=False)
-        raise
+# ── Conversation handling ─────────────────────────────────────────────────────
+def clean_assistant(text: str) -> str:
+    """Drop thinking blocks and our own trace appendix before a turn is resent or hashed."""
+    text = THINK_RE.sub("", text)
+    cut = text.find(TRACE_MARK)
+    return (text[:cut] if cut >= 0 else text).strip()
 
 
-def chat_stream(model_alias: str, messages: list, temperature: float = 0.3):
-    """Streaming chat — yields tokens as they arrive from LiteLLM."""
-    r = requests.post(
-        f"{LITELLM_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-        json={"model": model_alias, "messages": messages, "temperature": temperature, "stream": True},
-        timeout=600,
-        stream=True,
+def last_user_index(messages: list[dict]) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            return i
+    return -1
+
+
+def build_conversation(messages: list[dict], system: str, budget_chars: int = HISTORY_CHARS) -> list[dict]:
+    """
+    System prompt, then as many recent turns as fit the history budget, ending
+    with the latest user message (always kept whole). The client's own system
+    messages are appended to ours instead of being dropped.
+    """
+    end = last_user_index(messages)
+    client_system = "\n\n".join(
+        text_of(m.get("content")) for m in messages if m.get("role") == "system" and m.get("content")
     )
-    for line in r.iter_lines():
-        if line:
-            decoded = line.decode("utf-8")
-            if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                try:
-                    chunk = json.loads(decoded[6:])
-                    delta = chunk["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        yield delta
-                except Exception:
-                    pass
+    turns = []
+    for m in messages[: end + 1]:
+        role = m.get("role")
+        if role == "user":
+            turns.append({"role": "user", "content": text_of(m.get("content"))})
+        elif role == "assistant":
+            content = clean_assistant(text_of(m.get("content")))
+            if content:
+                turns.append({"role": "assistant", "content": content})
+
+    kept = turns[-1:]
+    used = 0
+    for m in reversed(turns[:-1]):
+        used += len(m["content"])
+        if used > budget_chars:
+            break
+        kept.insert(0, m)
+    while len(kept) > 1 and kept[0]["role"] == "assistant":
+        kept.pop(0)
+
+    full_system = system + (f"\n\n{client_system}" if client_system else "")
+    return [{"role": "system", "content": full_system}] + kept
 
 
-# ── Step 1 — Enhance + Classify ───────────────────────────────────────────────
-ENHANCE_SYSTEM = """You are a prompt engineer and intent classifier.
-
-Given a user message (possibly casual or brief), do two things:
-1. Rewrite it as a clear, detailed prompt that preserves the original intent but adds helpful context and specificity. Keep it concise — do not pad.
-2. Classify the intent as ONE of: code | reasoning | code+reasoning | general
-
-Rules for classification:
-- code: writing, fixing, reviewing, or explaining specific code — use when asked to show, list, find, or describe code/files
-- reasoning: design decisions, architecture, debugging logic, "why", "how should I" — pure thinking, no code needed
-- code+reasoning: ONLY when user explicitly wants something DESIGNED AND BUILT from scratch — e.g. "design and implement", "create a new feature", "build this"
-- general: concepts, summaries, chat, questions that don't need code or deep reasoning
-
-IMPORTANT: "what does X do", "list my routes", "explain this file", "what are my components" = code (NOT code+reasoning)
-ONLY use code+reasoning when the user clearly wants NEW code written after thinking through a solution.
-
-needs_rag should be true when ANY of these apply:
-- Query mentions "my project", "my code", "my repo", "my file", "this project", "this code"
-- Query is about a specific file, component, function, or feature in a codebase
-- Query mentions specific framework terms like "agent page", "dashboard", "component", "route", "API"
-- Intent is "code" or "code+reasoning"
-
-Respond ONLY with valid JSON, no markdown:
-{
-  "enhanced_prompt": "...",
-  "intent": "code|reasoning|code+reasoning|general",
-  "needs_rag": true|false,
-  "rag_reason": "brief reason or empty string"
-}
-"""
-
-
-def enhance_and_classify(user_message: str) -> dict:
-    msg_lower = user_message.lower()
-    keyword_rag = any(t in msg_lower for t in RAG_TRIGGERS)
-
-    try:
-        result = chat(
-            "classifier",
-            [
-                {"role": "system", "content": ENHANCE_SYSTEM},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,
-        )
-
-        clean = result.strip()
-        for fence in ["```json", "```"]:
-            clean = clean.replace(fence, "")
-        clean = clean.strip()
-
-        start = clean.find("{")
-        end = clean.rfind("}") + 1
-        if start >= 0 and end > start:
-            clean = clean[start:end]
-
-        parsed = json.loads(clean)
-
-    except Exception as e:
-        print(f"[Classify] parse error: {e} — using fallback")
-        intent = "general"
-        if any(w in msg_lower for w in ["write", "build", "create", "implement", "fix", "code", "function"]):
-            intent = "code"
-        elif any(w in msg_lower for w in ["why", "how should", "design", "architect", "explain"]):
-            intent = "reasoning"
-        parsed = {
-            "enhanced_prompt": user_message,
-            "intent": intent,
-            "needs_rag": keyword_rag,
-            "rag_reason": "fallback classifier",
-        }
-
-    if keyword_rag:
-        parsed["needs_rag"] = True
-        if not parsed.get("rag_reason"):
-            parsed["rag_reason"] = "keyword match"
-
-    return parsed
-
-
-# ── Step 2 — Execute (non-streaming) ─────────────────────────────────────────
-def execute(intent: str, enhanced_prompt: str, rag_context: str, tracker: StepTimer) -> tuple[str, list[str]]:
-    system_base = "You are a helpful expert assistant."
+def system_prompt(intent: str, rag_context: str) -> str:
+    parts = ["You are a helpful expert assistant."]
+    extra = ROUTES.get(intent, ROUTES["general"])[2]
+    if extra:
+        parts.append(extra)
     if rag_context:
-        system_base += f"\n\n{rag_context}"
+        parts.append(rag_context)
+    return "\n\n".join(parts)
 
-    if intent == "general":
-        tracker.start("llm_general")
-        answer = chat(
-            "general",
-            [
-                {"role": "system", "content": system_base},
-                {"role": "user", "content": enhanced_prompt},
-            ],
-        )
-        tracker.end("llm_general")
-        return answer, ["general (llama3.1:8b)"]
 
-    if intent == "code":
-        tracker.start("llm_code")
-        answer = chat(
-            "coding",
-            [
-                {
-                    "role": "system",
-                    "content": system_base + "\nWrite clean, production-ready code with comments.",
-                },
-                {"role": "user", "content": enhanced_prompt},
-            ],
-        )
-        tracker.end("llm_code")
-        return answer, ["coding (qwen2.5-coder:7b)"]
+# ── Traces ────────────────────────────────────────────────────────────────────
+class TraceStore:
+    """Last N traces, keyed by a hash of the answer text the client will send back."""
 
-    if intent == "reasoning":
-        tracker.start("llm_reasoning")
-        answer = chat(
-            "reasoning",
-            [
-                {"role": "system", "content": system_base + "\nThink step by step. Be thorough."},
-                {"role": "user", "content": enhanced_prompt},
-            ],
-        )
-        tracker.end("llm_reasoning")
-        return answer, ["reasoning (deepseek-r1:8b)"]
+    def __init__(self, size: int = 256):
+        self.size = size
+        self._data: OrderedDict[str, str] = OrderedDict()
 
-    if intent == "code+reasoning":
-        tracker.start("llm_reasoning")
-        reasoning_answer = chat(
-            "reasoning",
-            [
-                {
-                    "role": "system",
-                    "content": system_base + "\nThink step by step. Produce a clear solution design.",
-                },
-                {"role": "user", "content": enhanced_prompt},
-            ],
-        )
-        tracker.end("llm_reasoning")
+    @staticmethod
+    def key(answer: str) -> str:
+        return hashlib.sha256(" ".join(clean_assistant(answer).split()).encode()).hexdigest()
 
-        tracker.start("llm_code")
-        coding_prompt = (
-            f"Based on this solution design:\n\n{reasoning_answer}\n\n"
-            f"Now implement the code for:\n{enhanced_prompt}"
-        )
-        code_answer = chat(
-            "coding",
-            [
-                {
-                    "role": "system",
-                    "content": system_base + "\nWrite clean, production-ready code with comments.",
-                },
-                {"role": "user", "content": coding_prompt},
-            ],
-        )
-        tracker.end("llm_code")
+    def put(self, answer: str, trace: str) -> None:
+        k = self.key(answer)
+        self._data[k] = trace
+        self._data.move_to_end(k)
+        while len(self._data) > self.size:
+            self._data.popitem(last=False)
 
-        combined = f"{reasoning_answer}\n\n---\n\n### Implementation\n\n{code_answer}"
-        return combined, ["reasoning (deepseek-r1:8b)", "coding (qwen2.5-coder:7b)"]
+    def get(self, answer: str) -> str | None:
+        return self._data.get(self.key(answer))
 
-    # fallback
-    tracker.start("llm_fallback")
-    answer = chat(
-        "general",
-        [
-            {"role": "system", "content": system_base},
-            {"role": "user", "content": enhanced_prompt},
-        ],
+
+TRACES = TraceStore()
+
+
+def trace_followup(messages: list[dict]) -> str | None:
+    """If the latest message asks how the previous answer was made and we still have its trace, return it."""
+    end = last_user_index(messages)
+    if end < 0:
+        return None
+    ask = " ".join(text_of(messages[end].get("content")).lower().split())
+    if not any(p in ask for p in TRACE_FOLLOWUPS):
+        return None
+    for m in reversed(messages[:end]):
+        if m.get("role") == "assistant":
+            return TRACES.get(text_of(m.get("content")))
+    return None
+
+
+def format_trace(requested, labels, source, rag_used, models_used, tracker: StepTimer) -> str:
+    return (
+        f"{TRACE_MARK}\n"
+        f"- Requested model: `{requested}`\n"
+        f"- Intent: `{labels['intent']}` ({source})\n"
+        f"- Complexity: `{labels['complexity']}`\n"
+        f"- RAG used: `{'yes' if rag_used else 'no'}`\n"
+        f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n\n" + tracker.summary()
     )
-    tracker.end("llm_fallback")
-    return answer, ["general (llama3.1:8b)"]
+
+
+# ── Response helpers ──────────────────────────────────────────────────────────
+def completion_body(text: str, model: str) -> dict:
+    now = int(time.time())
+    return {
+        "id": f"jarvis-{now}",
+        "object": "chat.completion",
+        "created": now,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+def sse(msg_id: str, model: str, content: str | None = None, finish: str | None = None) -> str:
+    delta = {"content": content} if content is not None else {}
+    chunk = {
+        "id": msg_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def respond(text: str, stream: bool, model: str):
+    """A finished answer, as JSON or as a one chunk stream, whichever the client asked for."""
+    if not stream:
+        return JSONResponse(completion_body(text, model))
+
+    async def gen():
+        msg_id = f"jarvis-{int(time.time())}"
+        yield sse(msg_id, model, text)
+        yield sse(msg_id, model, finish="stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+async def stream_answer(alias: str, convo: list[dict], model: str, on_done):
+    """
+    Relay tokens as they arrive. Thinking tokens are wrapped in <think> tags,
+    which Open WebUI shows as a collapsible block, so a reasoning model is no
+    longer silent while it thinks. A model error becomes visible text.
+    """
+    msg_id = f"jarvis-{int(time.time())}"
+    answer: list[str] = []
+    thinking = False
+    try:
+        async for kind, text in llm.stream(alias, convo):
+            if kind == "reasoning":
+                if not thinking:
+                    thinking = True
+                    text = "<think>\n" + text
+                yield sse(msg_id, model, text)
+                continue
+            if thinking:
+                thinking = False
+                yield sse(msg_id, model, "\n</think>\n\n")
+            answer.append(text)
+            yield sse(msg_id, model, text)
+        if thinking:
+            yield sse(msg_id, model, "\n</think>\n\n")
+    except llm.LLMError as e:
+        note = f"\n\n[Jarvis] {e}"
+        answer.append(note)
+        yield sse(msg_id, model, note)
+    tail = on_done("".join(answer))
+    if tail:
+        yield sse(msg_id, model, tail)
+    yield sse(msg_id, model, finish="stop")
+    yield "data: [DONE]\n\n"
 
 
 # ── Main endpoint ─────────────────────────────────────────────────────────────
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def completions(request: Request):
-    body = await request.json()
-    messages = body.get("messages", [])
-    wants_stream = body.get("stream", False)
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "Body must be JSON"}, status_code=400)
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return JSONResponse({"error": "messages must be a list"}, status_code=400)
+    stream = bool(body.get("stream"))
+    requested = str(body.get("model") or "jarvis")
 
-    user_msg = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            user_msg = m.get("content", "")
-            break
-
-    if not user_msg:
+    end = last_user_index(messages)
+    user_msg = text_of(messages[end].get("content")) if end >= 0 else ""
+    if not user_msg.strip():
         return JSONResponse({"error": "No user message found"}, status_code=400)
 
-    wants_trace = any(t in user_msg.lower() for t in TRACE_TRIGGERS)
+    # "which model answered?" about the previous turn: answer from the trace store.
+    previous_trace = trace_followup(messages)
+    if previous_trace:
+        return respond(previous_trace.strip().removeprefix("---").strip(), stream, requested)
+
     tracker = StepTimer()
+    want_trace = requested == "jarvis-trace" or request.headers.get("x-jarvis-trace", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
-    # Step 1 — parallel enhance+classify AND early RAG keyword check
-    msg_lower = user_msg.lower()
-    keyword_rag = any(t in msg_lower for t in RAG_TRIGGERS)
+    rag_task = None
+    if any(t in user_msg.lower() for t in RAG_TRIGGERS):
+        rag_task = asyncio.create_task(asyncio.to_thread(rag_query, user_msg))
 
-    tracker.start("enhance_classify")
-    tracker.start("rag")
+    forced = EXPLICIT_MODELS.get(requested)
+    if forced:
+        labels = {"intent": forced, "complexity": "n/a", "needs_rag": False}
+        source = f"explicit model `{requested}`"
+    else:
+        tracker.start("classify")
+        labels, source = await classify.classify(messages, llm.complete)
+        tracker.end("classify")
+    intent = labels["intent"]
 
-    rag_future = None
-    classify_future = None
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        # Always start classify
-        classify_future = executor.submit(enhance_and_classify, user_msg)
-
-        # Start RAG early if keyword match detected
-        if keyword_rag:
-            rag_future = executor.submit(rag_query, user_msg)
-
-        # Get classify result
-        try:
-            meta = classify_future.result()
-        except Exception as e:
-            print(f"[Classify] error: {e}")
-            meta = {"enhanced_prompt": user_msg, "intent": "general", "needs_rag": False, "rag_reason": ""}
-
-        tracker.end("enhance_classify")
-
-        enhanced_prompt = meta.get("enhanced_prompt", user_msg)
-        intent = meta.get("intent", "general")
-        needs_rag = meta.get("needs_rag", False)
-
-        # If RAG wasn't started but intent needs it, start now
-        rag_context = ""
-        if rag_future is None and (needs_rag or intent in ("code", "code+reasoning")):
-            rag_future = executor.submit(rag_query, enhanced_prompt)
-
-        # Get RAG result if running
-        if rag_future is not None:
-            try:
-                rag_context = rag_future.result()
-            except Exception as e:
-                print(f"[RAG] parallel error: {e}")
-                rag_context = ""
-
+    if rag_task is None and (labels["needs_rag"] or intent in ("code", "code+reasoning")):
+        rag_task = asyncio.create_task(asyncio.to_thread(rag_query, user_msg))
+    rag_context = ""
+    if rag_task is not None:
+        tracker.start("rag")
+        rag_context = await rag_task
         tracker.end("rag")
 
-    system_base = "You are a helpful expert assistant."
-    if rag_context:
-        system_base += f"\n\n{rag_context}"
-
-    # Step 3 — check if task needs decomposition
-    if intent == "code+reasoning" and not wants_trace:
-        print("[Decomposer] Routing to task decomposer...")
+    # Design and build: the decomposer (sync, so it runs in a worker thread).
+    # It still sees only the latest message; Day 4 reworks it.
+    if intent == "code+reasoning":
         tracker.start("task_decomposition")
-        # Run decomposer in a worker thread so the async event loop isn't blocked.
-        # Use asyncio.to_thread (clean, no manual executor management).
-        import asyncio
-
-        decomp = await asyncio.to_thread(decompose_and_execute, enhanced_prompt, rag_context)
+        decomp = await asyncio.to_thread(decompose_and_execute, user_msg, rag_context)
         tracker.end("task_decomposition")
+        answer = decomp["answer"] + f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
+        trace = format_trace(requested, labels, source, bool(rag_context), decomp["models_used"], tracker)
+        TRACES.put(answer, trace)
+        return respond(answer + (trace if want_trace else ""), stream, requested)
 
-        answer = decomp["answer"]
-        models_used = decomp["models_used"]
-        subtask_info = f"\n\n*Decomposed into {len(decomp['subtasks'])} subtasks*"
-        answer += subtask_info
+    alias, model_name, _ = ROUTES.get(intent, ROUTES["general"])
+    convo = build_conversation(messages, system_prompt(intent, rag_context))
+    step = f"llm_{alias}"
 
-        return JSONResponse(
-            {
-                "id": f"jarvis-{int(tracker.wall_start)}",
-                "object": "chat.completion",
-                "created": int(tracker.wall_start),
-                "model": "jarvis",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": answer},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
+    def finish(answer: str) -> str:
+        tracker.end(step)
+        trace = format_trace(requested, labels, source, bool(rag_context), [model_name], tracker)
+        TRACES.put(answer, trace)
+        return trace if want_trace else ""
+
+    tracker.start(step)
+    if stream:
+        return StreamingResponse(
+            stream_answer(alias, convo, requested, finish), media_type="text/event-stream"
         )
 
-    # Step 3 — streaming path (simple intents only, no trace, no chaining)
-    if wants_stream and not wants_trace and intent != "code+reasoning":
-        model_alias = MODELS.get(intent, "general")
-        system_msg = system_base
-        if intent == "code":
-            system_msg += "\nWrite clean, production-ready code with comments."
-        elif intent == "reasoning":
-            system_msg += "\nThink step by step. Be thorough."
-
-        msg_id = f"jarvis-{int(time.time())}"
-
-        def stream_generator():
-            for token in chat_stream(
-                model_alias,
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": enhanced_prompt},
-                ],
-            ):
-                chunk = {
-                    "id": msg_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": "jarvis",
-                    "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-
-    # Step 3 — non-streaming execute
-    answer, models_used = execute(intent, enhanced_prompt, rag_context, tracker)
-
-    # Step 4 — trace
-    if wants_trace:
-        trace = (
-            f"\n\n---\n**Model trace:**\n"
-            f"- Intent: `{intent}`\n"
-            f"- RAG used: `{'yes' if rag_context else 'no'}`\n"
-            f"- Models: {', '.join(f'`{m}`' for m in models_used)}\n"
-            f"- Enhanced prompt: _{enhanced_prompt}_\n\n" + tracker.summary()
-        )
-        answer += trace
-
-    return JSONResponse(
-        {
-            "id": f"jarvis-{int(tracker.wall_start)}",
-            "object": "chat.completion",
-            "created": int(tracker.wall_start),
-            "model": "jarvis",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": answer},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        }
-    )
+    try:
+        answer = await llm.complete(alias, convo)
+    except llm.LLMError as e:
+        tracker.end(step)
+        return JSONResponse({"error": {"message": str(e), "type": "upstream_error"}}, status_code=502)
+    return respond(answer + finish(answer), False, requested)
 
 
 # ── Other endpoints ───────────────────────────────────────────────────────────
 @app.get("/health")
-def health():
-    return {"status": "ok", "gateway": "jarvis", "port": 4001}
+async def health():
+    return {"status": "ok", "gateway": "jarvis", "port": int(GATEWAY.get("port", 4001))}
 
 
-@app.get("/v1/models")
-def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": "coding", "object": "model", "owned_by": "jarvis"},
-            {"id": "reasoning", "object": "model", "owned_by": "jarvis"},
-            {"id": "general", "object": "model", "owned_by": "jarvis"},
-        ],
-    }
+@app.get("/v1/models", dependencies=[Depends(require_api_key)])
+async def list_models():
+    return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "jarvis"} for m in MODEL_IDS]}
 
 
+# Probe endpoints some clients call during setup; they return nothing sensitive.
 @app.get("/v1/openapi.json")
-def openapi_spec():
-    return {"openapi": "3.0.0", "info": {"title": "Jarvis Gateway", "version": "1.0.0"}, "paths": {}}
+async def openapi_spec():
+    return {"openapi": "3.0.0", "info": {"title": "Jarvis Gateway", "version": "2.0.0"}, "paths": {}}
 
 
 @app.get("/v1/api/config")
-def api_config():
-    return {"status": "ok", "name": "Jarvis Gateway", "version": "1.0.0"}
+async def api_config():
+    return {"status": "ok", "name": "Jarvis Gateway", "version": "2.0.0"}
 
 
 if __name__ == "__main__":
-    print("🧠 Jarvis Smart Gateway starting on port 4001...")
-    print("   Enhance → Classify → RAG → Route → Stream")
-    print("   Point your tools to: http://localhost:4001/v1")
-    uvicorn.run(app, host="0.0.0.0", port=4001)
+    if not API_KEY:
+        raise SystemExit(
+            f"JARVIS_API_KEY is not set in {settings.env_file}. The gateway will not start without it."
+        )
+    host = GATEWAY.get("host", "0.0.0.0")
+    port = int(GATEWAY.get("port", 4001))
+    print(f"🧠 Jarvis gateway on {host}:{port} (API key required)")
+    uvicorn.run(app, host=host, port=port)
