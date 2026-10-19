@@ -11,7 +11,7 @@ Open WebUI / Continue / curl
             |
             v
    +-------------------+
-   |  Jarvis Gateway   |  :4001  enhance -> classify -> RAG -> route -> execute -> validate
+   |  Jarvis Gateway   |  :4001  auth -> classify -> RAG -> route -> execute -> validate
    |  (FastAPI, mini)  |
    +-------------------+
      |      |       |
@@ -29,7 +29,7 @@ Open WebUI / Continue / curl
   Neo4j AuraDB (RAG graph)   Neon Postgres (LiteLLM state)   SQLite (traces, evals)
 ```
 
-Requests are classified by a resident 3B model into an intent (general, code, reasoning, code+reasoning) and, in v2, a complexity (small or large). Simple requests stream straight through the matching small model on the mini. Large or design-and-build requests go to the 30B model on the MacBook Pro when it is online, and to the mini's smaller models when it is not. Design-and-build requests are decomposed into subtasks by a LangGraph graph with structured handoff from a reasoning step to a code step, cascade protection for failed subtasks, and a memory safe tracer that streams model thinking to disk instead of holding it in RAM.
+Requests are classified by a resident 3B model into an intent (general, code, reasoning, code+reasoning), a complexity (simple, medium or complex) and whether they need RAG. The classifier only labels: it never rewrites the request, and the model receives your own words ([ADR 0008](docs/adr/0008-labels-only-classifier.md)). Simple general and code requests stream straight through a small model on the mini. Reasoning requests always use the large tier: the 30B model on the MacBook Pro when it is online, and deepseek-r1 on the mini when the laptop is away. A design-and-build request is one call to the 30B ([ADR 0007](docs/adr/0007-large-model-first-decomposer-as-fallback.md)). The task decomposer runs only when the 30B is unavailable or the model is `jarvis-decompose`; it splits the work into subtasks with a LangGraph graph, structured handoff from a reasoning step to a code step, cascade protection for failed subtasks, and a memory safe tracer that streams model thinking to disk instead of holding it in RAM.
 
 ## Hardware
 
@@ -53,7 +53,32 @@ cp .env.example ~/.jarvis.env    # then fill in every value
 ./scripts/stop.sh
 ```
 
-Point any OpenAI compatible client at `http://localhost:4001/v1`. Open WebUI and Continue must send the value of `JARVIS_API_KEY` as the API key for the Jarvis connection. Every route except `GET /health` rejects a missing or wrong key. To get the routing and timing trace appended to an answer, pick the `jarvis-trace` model or send the header `X-Jarvis-Trace: 1`; streamed answers get it as the last chunk. Asking "which model answered?" or "show trace" (a short message that starts or ends with that phrase) right after an answer returns that answer's trace without calling a model.
+Point any OpenAI compatible client at `http://localhost:4001/v1`. `./scripts/start.sh` refuses to start unless `JARVIS_API_KEY` is set in `~/.jarvis.env` (generate one with `openssl rand -hex 32`). Open WebUI and Continue must send that value as the API key for the Jarvis connection. Every `/v1` route needs it as a bearer token; only `GET /health` does not:
+
+```bash
+curl http://localhost:4001/health
+curl http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $JARVIS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "jarvis", "messages": [{"role": "user", "content": "Explain a DAG in one sentence."}]}'
+```
+
+A missing or wrong key gets HTTP 401.
+
+### Models
+
+| Model id | What it does |
+|---|---|
+| `jarvis` | auto routed: the classifier picks intent and complexity |
+| `general`, `coding`, `reasoning` | skip the classifier and use that intent |
+| `jarvis-trace` | auto routed, with the routing and timing trace appended |
+| `jarvis-decompose` | force the task decomposer |
+
+### Traces, thinking and errors
+
+To get the trace appended to an answer, pick `jarvis-trace` or send the header `X-Jarvis-Trace: 1`; streamed answers get it as the last chunk. Asking "which model answered?" or "show trace" (a short message that is, starts with or ends with that phrase) right after an answer returns that answer's trace without calling a model. Traces are kept in memory for the last 256 answers.
+
+A model's thinking streams inside a `<think>` block, which Open WebUI shows as a collapsible block, and is never sent back to a model as history. When a model call fails, the answer says so in a line starting `[Jarvis]` (streamed) or the request returns HTTP 502 with the reason (not streamed).
 
 Logs and traces land in `.logs/` (gitignored). Topology, tiers and budgets are in `jarvis.yaml`; secrets are only ever in `~/.jarvis.env`.
 
