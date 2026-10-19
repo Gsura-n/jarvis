@@ -35,6 +35,7 @@ build-backend = "hatchling.build"
 packages = ["src/jarvis"]
 
 [tool.uv]
+exclude-newer = "7 days"
 package = true
 
 [tool.ruff]

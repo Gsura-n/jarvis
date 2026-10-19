@@ -122,7 +122,7 @@ def fit_input(
 
     if caps:
         if "system" in caps and estimate_tokens(system) > int(caps["system"]):
-            log.warning("system prompt over cap tokens=%s cap=%s", estimate_tokens(system), caps["system"])
+            log.warning("system prompt over cap estimate=%s cap=%s", estimate_tokens(system), caps["system"])
         if rag and "rag" in caps and estimate_tokens(rag) > int(caps["rag"]):
             rag = _trim_text(rag, int(caps["rag"]))
             _mark(trimmed, "rag")
@@ -187,11 +187,11 @@ def assemble_messages(
         block=block,
     )
     if "history" in fitted.trimmed:
-        log.info("trimmed history num_ctx=%s max_tokens=%s", num_ctx, max_tokens)
+        log.info("trimmed history num_ctx=%s answer_budget=%s", num_ctx, max_tokens)
     rest = [part for part in fitted.trimmed if part != "history"]
     if rest:
         log.warning(
-            "trimmed input to fit num_ctx=%s max_tokens=%s parts=%s",
+            "trimmed input to fit num_ctx=%s answer_budget=%s parts=%s",
             num_ctx,
             max_tokens,
             ",".join(rest),
