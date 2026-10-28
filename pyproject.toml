@@ -18,6 +18,7 @@ dependencies = [
   "langgraph>=0.2",
   "watchdog>=4.0",
   "litellm[proxy]>=1.50",
+  "filelock>=4.2.1",
 ]
 
 [dependency-groups]
