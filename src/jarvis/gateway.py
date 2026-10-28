@@ -146,21 +146,22 @@ def rag_query(question: str, top_k: int = 4) -> str:
         embedding = get_embedding(question)
         if not embedding:
             return ""
-        records, _, _ = driver.execute_query(
-            Query(
-                """
-                MATCH (f:File)
-                WHERE f.embedding IS NOT NULL
-                WITH f, vector.similarity.cosine(f.embedding, $emb) AS score
-                ORDER BY score DESC LIMIT $k
-                RETURN f.path AS path, f.content_preview AS preview, score
-                """,
-                timeout=NEO4J_TIMEOUT,
-            ),
-            emb=embedding,
-            k=top_k,
-        )
-        rows = [dict(r) for r in records]
+        with driver.session() as session:
+            result = session.run(
+                Query(
+                    """
+                    MATCH (f:File)
+                    WHERE f.embedding IS NOT NULL
+                    WITH f, vector.similarity.cosine(f.embedding, $emb) AS score
+                    ORDER BY score DESC LIMIT $k
+                    RETURN f.path AS path, f.content_preview AS preview, score
+                    """,
+                    timeout=NEO4J_TIMEOUT,
+                ),
+                emb=embedding,
+                k=top_k,
+            )
+            rows = [dict(r) for r in result]
         if not rows:
             return ""
         parts = ["### Relevant codebase context (via RAG):"]
