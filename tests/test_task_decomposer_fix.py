@@ -24,14 +24,14 @@ def test_synthesis_failure_keeps_previous_results(monkeypatch):
             if call_count == 2:  # Fail on step 2
                 return "[ERROR] failed synthesis"
             return user
-        return "compressed"
+        return "compressed" * 5
 
     monkeypatch.setattr(task_decomposer, "call_model", mock_call_model)
 
     new_state = task_decomposer.aggregate_results(state)
     ans = new_state["final_answer"]
-    assert "Task 1" in ans
-    assert "Task 2" in ans
+    assert "a" * 1600 in ans
+    assert "b" * 1600 in ans
     assert "[ERROR]" not in ans
 
 
@@ -52,16 +52,16 @@ def test_synthesis_all_fail(monkeypatch):
     def mock_call_model(model, system, user, *args, **kwargs):
         if "technical writer" in system:
             return "[ERROR] failed synthesis completely"
-        return "compressed"
+        return "compressed" * 5
 
     monkeypatch.setattr(task_decomposer, "call_model", mock_call_model)
 
     new_state = task_decomposer.aggregate_results(state)
     ans = new_state["final_answer"]
-    assert "Task 1" in ans
-    assert "Task 2" in ans
-    assert "Task 3" in ans
-    assert "Task 4" in ans
+    assert "a" * 1600 in ans
+    assert "b" * 1600 in ans
+    assert "c" * 1600 in ans
+    assert "d" * 1600 in ans
 
 
 def test_smart_compress_reasoning_fails(monkeypatch):
@@ -105,11 +105,21 @@ def test_happy_path(monkeypatch):
     def mock_call_model(model, system, user, *args, **kwargs):
         if "technical writer" in system:
             return f"Synthesized: {user}"
-        return "compressed"
+        return "compressed" * 5
 
     monkeypatch.setattr(task_decomposer, "call_model", mock_call_model)
     new_state = task_decomposer.aggregate_results(state)
     ans = new_state["final_answer"]
     assert "Synthesized:" in ans
-    assert "compressed" in ans or "Task 4" in ans
+    assert (
+        ans
+        == "Synthesized: Running synthesis so far:\nSynthesized: Running synthesis so far:\nSynthesized: Running synthesis so far:\n# Test Prompt\n\n## Task 1\n\n"
+        + "compressed" * 5
+        + "\n\n\nNew subtask result to integrate:\n## Task 2\n"
+        + "compressed" * 5
+        + "\n\nNew subtask result to integrate:\n## Task 3\n"
+        + "compressed" * 5
+        + "\n\nNew subtask result to integrate:\n## Task 4\n"
+        + "compressed" * 5
+    )
     assert "[ERROR]" not in ans
