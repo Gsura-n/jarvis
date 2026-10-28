@@ -42,6 +42,6 @@ async def test_completions_does_not_block_event_loop(monkeypatch):
         assert health_response.status_code == 200
         assert chat_response.status_code == 200
 
-        assert health_finish < chat_finish - 0.5, (
-            f"Health took {health_finish:.2f}s, chat took {chat_finish:.2f}s"
-        )
+        assert (
+            health_finish < chat_finish - 0.5
+        ), f"Health took {health_finish:.2f}s, chat took {chat_finish:.2f}s"
