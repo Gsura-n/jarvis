@@ -37,6 +37,8 @@ packages = ["src/jarvis"]
 [tool.uv]
 exclude-newer = "7 days"
 package = true
+# Security floor for a transitive dependency (pip-audit, Oct 2026). Not a direct dependency.
+constraint-dependencies = ["filelock>=4.2.1"]
 
 [tool.ruff]
 line-length = 110

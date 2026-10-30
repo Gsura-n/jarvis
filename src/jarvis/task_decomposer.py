@@ -436,7 +436,9 @@ def smart_compress(result: dict) -> str:
         for i, block in enumerate(code_blocks):
             prose = prose.replace(block, f"__CODE_BLOCK_{i}__")
         if len(prose) > 600:
-            prose = call_model("general", PROSE_COMPRESS_SYSTEM, prose, temperature=0.1)
+            new_prose = call_model("general", PROSE_COMPRESS_SYSTEM, prose, temperature=0.1)
+            if not is_broken_result(new_prose):
+                prose = new_prose
         # restore code blocks
         for i, block in enumerate(code_blocks):
             prose = prose.replace(f"__CODE_BLOCK_{i}__", f"\n{block}\n")
@@ -446,12 +448,14 @@ def smart_compress(result: dict) -> str:
     if result["intent"] == "reasoning":
         if len(text) < 800:
             return text
-        return call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+        res = call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+        return text if is_broken_result(res) else res
 
     # General — compress more aggressively
     if len(text) < 400:
         return text
-    return call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+    res = call_model("general", PROSE_COMPRESS_SYSTEM, text, temperature=0.1)
+    return text if is_broken_result(res) else res
 
 
 def aggregate_results(state: JarvisState) -> JarvisState:
@@ -504,7 +508,11 @@ def aggregate_results(state: JarvisState) -> JarvisState:
             f"Running synthesis so far:\n{synthesis}\n\n"
             f"New subtask result to integrate:\n## {c['task']}\n{c['content']}"
         )
-        synthesis = call_model("general", SYNTHESIS_SYSTEM, synthesis_input, temperature=0.2)
+        new_synthesis = call_model("general", SYNTHESIS_SYSTEM, synthesis_input, temperature=0.2)
+        if is_broken_result(new_synthesis):
+            synthesis += f"\n## {c['task']}\n\n{c['content']}\n"
+        else:
+            synthesis = new_synthesis
 
     print(f"   ✅ Final answer ({len(synthesis)} chars)")
     return {**state, "final_answer": synthesis}
