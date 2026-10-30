@@ -13,7 +13,6 @@ import hmac
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from functools import partial
 
@@ -22,7 +21,7 @@ import requests
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Query
 from starlette.middleware.cors import CORSMiddleware
 
 from jarvis.budget import (
@@ -50,6 +49,7 @@ LITELLM_KEY = settings.litellm_key
 NEO4J_URI = settings.neo4j_uri
 NEO4J_USER = settings.neo4j_user
 NEO4J_PASSWORD = settings.neo4j_password
+NEO4J_TIMEOUT = 10
 OLLAMA_BASE = settings.ollama_base
 EMBED_MODEL = settings.embed_model
 
@@ -148,13 +148,16 @@ def rag_query(question: str, top_k: int = 4) -> str:
             return ""
         with driver.session() as session:
             result = session.run(
-                """
-                MATCH (f:File)
-                WHERE f.embedding IS NOT NULL
-                WITH f, vector.similarity.cosine(f.embedding, $emb) AS score
-                ORDER BY score DESC LIMIT $k
-                RETURN f.path AS path, f.content_preview AS preview, score
-                """,
+                Query(
+                    """
+                    MATCH (f:File)
+                    WHERE f.embedding IS NOT NULL
+                    WITH f, vector.similarity.cosine(f.embedding, $emb) AS score
+                    ORDER BY score DESC LIMIT $k
+                    RETURN f.path AS path, f.content_preview AS preview, score
+                    """,
+                    timeout=NEO4J_TIMEOUT,
+                ),
                 emb=embedding,
                 k=top_k,
             )
@@ -239,9 +242,9 @@ def describe_error(e: Exception) -> str:
     response = getattr(e, "response", None)
     if isinstance(e, requests.HTTPError) and response is not None:
         return _status_reason(response.status_code, response.text)
-    if isinstance(e, (requests.Timeout, httpx.TimeoutException)):
+    if isinstance(e, requests.Timeout | httpx.TimeoutException):
         return "timed out"
-    if isinstance(e, (requests.ConnectionError, httpx.TransportError)):
+    if isinstance(e, requests.ConnectionError | httpx.TransportError):
         return "could not reach the model server"
     return short_reason(f"{type(e).__name__}")
 
@@ -543,42 +546,43 @@ async def completions(request: Request):
     tracker.start("classify")
     tracker.start("rag")
 
-    rag_future = None
-    classify_future = None
+    rag_task = None
+    classify_task = None
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        if explicit:
-            labels = {"intent": _EXPLICIT_INTENT[explicit], "complexity": "simple", "needs_rag": False}
-            label_source = "explicit model"
-        else:
-            classify_future = executor.submit(classify, messages, chat, classify_deployment(snapshot))
+    if explicit:
+        labels = {"intent": _EXPLICIT_INTENT[explicit], "complexity": "simple", "needs_rag": False}
+        label_source = "explicit model"
+    else:
+        classify_task = asyncio.create_task(
+            asyncio.to_thread(classify, messages, chat, classify_deployment(snapshot))
+        )
 
-        # Keywords only start retrieval early. They never decide the intent.
-        if keyword_rag:
-            rag_future = executor.submit(rag_query, user_msg)
+    # Keywords only start retrieval early. They never decide the intent.
+    if keyword_rag:
+        rag_task = asyncio.create_task(asyncio.to_thread(rag_query, user_msg))
 
-        if classify_future is not None:
-            labels, label_source = classify_future.result()
+    if classify_task is not None:
+        labels, label_source = await classify_task
 
-        tracker.end("classify")
+    tracker.end("classify")
 
-        intent = labels["intent"]
-        needs_rag = labels["needs_rag"] or keyword_rag
+    intent = labels["intent"]
+    needs_rag = labels["needs_rag"] or keyword_rag
 
-        # If RAG wasn't started but the labels need it, start now
-        rag_context = ""
-        if rag_future is None and (needs_rag or intent in ("code", "code+reasoning")):
-            rag_future = executor.submit(rag_query, user_msg)
+    # If RAG wasn't started but the labels need it, start now
+    rag_context = ""
+    if rag_task is None and (needs_rag or intent in ("code", "code+reasoning")):
+        rag_task = asyncio.create_task(asyncio.to_thread(rag_query, user_msg))
 
-        # Get RAG result if running
-        if rag_future is not None:
-            try:
-                rag_context = rag_future.result()
-            except Exception as e:
-                print(f"[RAG] parallel error: {e}")
-                rag_context = ""
+    # Get RAG result if running
+    if rag_task is not None:
+        try:
+            rag_context = await rag_task
+        except Exception as e:
+            print(f"[RAG] parallel error: {e}")
+            rag_context = ""
 
-        tracker.end("rag")
+    tracker.end("rag")
 
     decision = decide(intent, labels["complexity"], explicit, snapshot, settings.topology)
     # Degraded design-and-build, or an explicit jarvis-decompose, stays on the mini.
